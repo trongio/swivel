@@ -60,6 +60,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        val prefs = getSharedPreferences("swivel", MODE_PRIVATE)
+        intent?.getStringExtra("swivel_host")?.let { prefs.edit().putString("host", it).apply() }
+        streamer.wifiHost = prefs.getString("host", null)
         streamer.start()
         tracker = NnTracker(this) { p, _ ->
             streamer.send(p)
@@ -95,6 +98,14 @@ class MainActivity : ComponentActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        intent.getStringExtra("swivel_host")?.let {
+            getSharedPreferences("swivel", MODE_PRIVATE).edit().putString("host", it).apply()
+            streamer.wifiHost = it
+        }
+    }
+
     override fun onDestroy() {
         streamer.stop()
         tracker?.close()
@@ -116,7 +127,8 @@ class MainActivity : ComponentActivity() {
                 }
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text("Swivel Cam", color = Color.White, fontSize = 26.sp)
-                    Text(if (connected) "Connected to Swivel" else "Waiting for Swivel on the PC (USB)…",
+                    Text(if (connected) "Connected to Swivel (${streamer.link})"
+                         else "Waiting for Swivel (USB, or WiFi ${streamer.wifiHost ?: "not set up yet"})…",
                         color = if (connected) Color(0xFF57E389) else Color(0xFFF6D32D), fontSize = 18.sp)
                     Text(if (!hasCamera) "Camera permission needed" else if (pose.valid) "Face: tracking" else "Face: not found",
                         color = Color.White, fontSize = 18.sp)

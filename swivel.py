@@ -244,8 +244,45 @@ class OneEuro:
         return self.x
 
 
-CAM_PORT = 4243
-PHONE_PORT = 4244  # Swivel Cam (Android) connects here through `adb reverse`
+CAM_PORT = 4243  # PC webcam helper -> Swivel (UDP)
+PHONE_PORT = 4244  # Swivel Cam app -> Swivel (TCP; USB via adb reverse, or WiFi)
+PHONE_UDP_PORT = 4245  # internal: relayed phone packets
+
+
+def lan_ip():
+    """This PC's address on the LAN (what the phone should connect to over WiFi)."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.168.0.1", 9))  # no packet is sent; just picks the outgoing interface
+            ip = s.getsockname()[0]
+            return None if ip.startswith("127.") else ip
+    except OSError:
+        return None
+
+
+class CamSource:
+    def __init__(self, name, port):
+        self.name, self.port = name, port
+        self.sock = self.thread = self.proc = self.log = None
+        self.raw = None  # (time, yaw, pitch) as reported
+        self.center = None
+        self.want_recenter = True
+        self.last = None  # (time, yaw, pitch) relative to center, gain applied
+        self.status = ""
+        self.link = ""
+
+    def close(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        for f in (self.sock, self.log):
+            if f:
+                f.close()
+        self.sock = self.log = self.proc = None
+        self.last = None
 CAM_STALE = 0.4  # seconds; older webcam poses are ignored
 CAM_TAU = 1.5  # seconds; how fast the webcam pulls the headphone center back
 CAM_MAX_SPEED_DPS = 40.0  # only correct while the head moves slower than this
@@ -296,12 +333,9 @@ class Engine:
         self.trace_t = 0.0
         self.assist_on = False
         self.recenters = 0
-        self.cam_proc = self.cam_sock = self.cam_thread = self.cam_log = None
-        self.cam = None  # (time, yaw, pitch) relative to the webcam center, signs applied
-        self.cam_raw = None  # (yaw, pitch) as the helper reports them
-        self.cam_center = None
-        self.cam_want_recenter = True
-        self.cam_status = ""
+        self.srcs = {}  # name -> CamSource
+        self.ctl_last = None
+        self.adb = None
 
     def shape(self, deg, max_deg, axis=0):
         """Head degrees -> stick deflection.
@@ -391,8 +425,8 @@ class Engine:
             self.sock.bind(("127.0.0.1", PORT))
             self.sock.settimeout(0.05)
         self.running = True
-        self.cam = self.cam_raw = None
-        self.cam_want_recenter = True
+        self.srcs = {}
+        self.ctl_last = None
         if self.mode() != "off":
             self._start_cam()
         self.want_recenter = True
@@ -435,67 +469,79 @@ class Engine:
                 self.proc.wait()
         self.proc = None
 
+    # ---- cameras: PC webcam helper and/or the Swivel Cam phone app ----------------
     def _start_cam(self):
-        if self.cfg.get("cam_device") == "phone":
-            return self._start_phone()
+        dev = self.cfg.get("cam_device", "/dev/video0")
+        if dev in ("phone", "both"):
+            self._start_phone()
+        if dev != "phone":
+            self._start_pc(dev if dev.startswith("/dev/") else "/dev/video0")
+
+    def _add_source(self, name, port):
+        src = CamSource(name, port)
+        src.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        src.sock.bind(("127.0.0.1", port))
+        src.sock.settimeout(0.1)
+        self.srcs[name] = src
+        src.thread = threading.Thread(target=self._cam_loop, args=(src,), daemon=True)
+        return src
+
+    def _start_pc(self, device):
         uv = find_uv()
         helper = HERE / "swivel_cam.py"
         if not uv or not helper.exists():
-            self.cam_status = "webcam helper unavailable (needs uv)"
             return
-        self.cam_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.cam_sock.bind(("127.0.0.1", CAM_PORT))
-        self.cam_sock.settimeout(0.1)
-        self.cam_log = open(Path(GLib.get_user_runtime_dir()) / "swivel-webcam.log", "w")
-        self.cam_proc = subprocess.Popen(
-            [uv, "run", "--quiet", "--script", str(helper), "--device", self.cfg.get("cam_device", "/dev/video0"),
-             "--port", str(CAM_PORT)], stdout=subprocess.DEVNULL, stderr=self.cam_log)
-        self.cam_status = "webcam starting"
-        self.cam_thread = threading.Thread(target=self._cam_loop, daemon=True)
-        self.cam_thread.start()
+        src = self._add_source("pc", CAM_PORT)
+        src.log = open(Path(GLib.get_user_runtime_dir()) / "swivel-webcam.log", "w")
+        src.proc = subprocess.Popen(
+            [uv, "run", "--quiet", "--script", str(helper), "--device", device, "--port", str(CAM_PORT)],
+            stdout=subprocess.DEVNULL, stderr=src.log)
+        src.status = "starting"
+        src.thread.start()
 
     def _start_phone(self):
-        """Use the Swivel Cam Android app over USB: adb reverse + a TCP relay into the cam pipeline."""
-        adb = shutil.which("adb") or str(Path.home() / "Android/Sdk/platform-tools/adb")
-        self.adb = adb
-        try:
-            subprocess.run([adb, "reverse", f"tcp:{PHONE_PORT}", f"tcp:{PHONE_PORT}"], capture_output=True, timeout=10)
-            subprocess.run([adb, "shell", "am", "start", "-n",
-                            "io.github.trongio.swivel.cam/io.github.trongio.swivel.MainActivity"],
-                           capture_output=True, timeout=10)
-        except (OSError, subprocess.TimeoutExpired):
-            self.cam_status = "phone: adb not available"
-            return
-        self.cam_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.cam_sock.bind(("127.0.0.1", CAM_PORT))
-        self.cam_sock.settimeout(0.1)
-        self.cam_status = "phone: waiting for Swivel Cam app"
-        threading.Thread(target=self._phone_relay, daemon=True).start()
-        self.cam_thread = threading.Thread(target=self._cam_loop, daemon=True)
-        self.cam_thread.start()
+        """Swivel Cam app: over USB (adb reverse) when connected, otherwise over WiFi."""
+        self.adb = shutil.which("adb") or str(Path.home() / "Android/Sdk/platform-tools/adb")
+        src = self._add_source("phone", PHONE_UDP_PORT)
+        src.status = "waiting for app"
+        self._adb_setup(launch=True)
+        threading.Thread(target=self._phone_relay, args=(src,), daemon=True).start()
+        src.thread.start()
 
-    def _phone_relay(self):
+    def _adb_setup(self, launch=False):
+        """Forward the port over USB and tell the app this PC's WiFi address (for when USB drops)."""
+        try:
+            subprocess.run([self.adb, "reverse", f"tcp:{PHONE_PORT}", f"tcp:{PHONE_PORT}"],
+                           capture_output=True, timeout=5)
+            if launch:
+                cmd = [self.adb, "shell", "am", "start", "-n",
+                       "io.github.trongio.swivel.cam/io.github.trongio.swivel.MainActivity"]
+                ip = lan_ip()
+                if ip:
+                    cmd += ["--es", "swivel_host", ip]
+                subprocess.run(cmd, capture_output=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def _phone_relay(self, src):
+        # listens on all interfaces so the app can also reach it over WiFi
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", PHONE_PORT))
-        srv.listen(1)
+        srv.bind(("0.0.0.0", PHONE_PORT))
+        srv.listen(2)
         srv.settimeout(0.5)
         out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         last_fix = 0.0
         try:
             while self.running:
-                # USB reconnects drop the adb forwarding; restore it every few seconds
-                if time.monotonic() - last_fix > 3:
+                if time.monotonic() - last_fix > 3:  # USB reconnects drop the adb forwarding
                     last_fix = time.monotonic()
-                    try:
-                        subprocess.run([self.adb, "reverse", f"tcp:{PHONE_PORT}", f"tcp:{PHONE_PORT}"],
-                                       capture_output=True, timeout=5)
-                    except (OSError, subprocess.TimeoutExpired):
-                        pass
+                    self._adb_setup()
                 try:
-                    conn, _ = srv.accept()
+                    conn, addr = srv.accept()
                 except socket.timeout:
                     continue
+                src.link = "USB" if addr[0].startswith("127.") else "WiFi"
                 conn.settimeout(1.0)
                 buf = b""
                 with conn:
@@ -504,26 +550,60 @@ class Engine:
                             data = conn.recv(4096)
                         except socket.timeout:
                             continue
+                        except OSError:
+                            break
                         if not data:
                             break
                         buf += data
                         while len(buf) >= 56:
-                            out.sendto(buf[:56], ("127.0.0.1", CAM_PORT))
+                            out.sendto(buf[:56], ("127.0.0.1", src.port))
                             buf = buf[56:]
-                self.cam_status = "phone: disconnected"
+                src.status = "app disconnected"
         finally:
             srv.close()
             out.close()
 
-    def _cam_loop(self):
-        last = None
+    def source_gain(self, name):
+        gains = self.cfg.get("cam_gain") or {}
+        if name in gains:
+            return gains[name]
+        return self.cfg.get("cam_sign", [1, 1]) if name == "pc" else [1, 1]
+
+    @property
+    def cam(self):
+        """Combined camera view (time, yaw, pitch): average of the cameras that see the head now."""
+        now = time.monotonic()
+        fresh = [s.last for s in self.srcs.values() if s.last and now - s.last[0] < CAM_STALE]
+        if not fresh:
+            return None
+        return (max(f[0] for f in fresh), sum(f[1] for f in fresh) / len(fresh), sum(f[2] for f in fresh) / len(fresh))
+
+    @property
+    def cam_status(self):
+        parts = []
+        for s in self.srcs.values():
+            label = {"pc": "webcam", "phone": "phone"}[s.name] + (f" ({s.link})" if s.link else "")
+            parts.append(f"{label}: {s.status}")
+        return "   ".join(parts)
+
+    @property
+    def cam_want_recenter(self):
+        return any(s.want_recenter for s in self.srcs.values())
+
+    @cam_want_recenter.setter
+    def cam_want_recenter(self, v):
+        for s in self.srcs.values():
+            s.want_recenter = v
+
+    def _cam_loop(self, src):
         while self.running:
             try:
-                data = self.cam_sock.recv(64)
+                data = src.sock.recv(64)
             except (socket.timeout, OSError):
                 data = None
-            if self.cam_proc and self.cam_proc.poll() is not None:
-                self.cam_status = "webcam helper stopped (see swivel-webcam.log)"
+            if src.proc and src.proc.poll() is not None:
+                src.status = "helper stopped (see swivel-webcam.log)"
+                src.last = None
                 break
             if not data or len(data) < 56:
                 continue
@@ -531,31 +611,31 @@ class Engine:
             now = time.monotonic()
             with self.lock:
                 if valid < 0.5:
-                    self.cam = None
-                    self.cam_status = "webcam: no face"
+                    src.last = None
+                    src.status = "no face"
                     continue
-                self.cam_raw = (yaw, pitch)
-                if self.cam_want_recenter or self.cam_center is None:
-                    self.cam_center = (yaw, pitch)
-                    self.cam_want_recenter = False
-                sy, sp = self.cfg.get("cam_sign", [1, 1])
-                cy = sy * (yaw - self.cam_center[0])
-                cp = sp * (pitch - self.cam_center[1])
-                self.cam = (now, cy, cp)
-                self.cam_status = "webcam: tracking"
+                src.raw = (now, yaw, pitch)
+                if self.mode() == "control" and self.want_recenter:
+                    for s in self.srcs.values():
+                        s.want_recenter = True
+                    self.want_recenter = False
+                if src.want_recenter or src.center is None:
+                    src.center = (yaw, pitch)
+                    src.want_recenter = False
+                gy, gp = self.source_gain(src.name)
+                src.last = (now, gy * (yaw - src.center[0]), gp * (pitch - src.center[1]))
+                src.status = "tracking"
                 if self.mode() == "control":
-                    if self.want_recenter:
-                        self.cam_center = (yaw, pitch)
-                        self.want_recenter = False
-                        cy = cp = 0.0
+                    _t, cy, cp = self.cam or src.last
                     if self.calib_sink is not None:
                         self.calib_sink.append((now, (cy, cp)))
                     self.yaw, self.pitch, self.roll = cy, cp, 0.0  # webcam roll is never used
+                    last = self.ctl_last
                     dt = now - last if last and 0 < now - last < 0.5 else 1 / 30
-                    last = now
+                    self.ctl_last = now
                     self._set_target(dt)
                     self.last_packet = now
-                    self.status = "Tracking (webcam)"
+                    self.status = "Tracking (camera)"
                     if not self.history or now - self.history[-1][0] >= 0.02:
                         self.history.append((now, self.yaw, self.pitch, self.roll))
 
@@ -608,21 +688,12 @@ class Engine:
 
     def stop(self, keep_status=False):
         self.running = False
-        for t in (self.thread, self.out_thread, self.cam_thread):
-            if t and t is not threading.current_thread():
+        for t in [self.thread, self.out_thread] + [s.thread for s in self.srcs.values()]:
+            if t and t.is_alive() and t is not threading.current_thread():
                 t.join(2)
-        if self.cam_proc and self.cam_proc.poll() is None:
-            self.cam_proc.terminate()
-            try:
-                self.cam_proc.wait(3)
-            except subprocess.TimeoutExpired:
-                self.cam_proc.kill()
-        self.cam_proc = None
-        for f in ("cam_sock", "cam_log"):
-            if getattr(self, f):
-                getattr(self, f).close()
-                setattr(self, f, None)
-        self.cam = None
+        for src in self.srcs.values():
+            src.close()
+        self.srcs = {}
         self._kill_proc()
         if self.errlog:
             self.errlog.close()
@@ -981,9 +1052,10 @@ class Window(Adw.ApplicationWindow):
 
         GLib.idle_add(hook_cam_row)
         ctl.add(cam_row)
-        srcs = ["/dev/video0", "phone"]
-        src_row = Adw.ComboRow(title="Camera source", subtitle="PC webcam, or the Swivel Cam app on a phone over USB",
-                               model=Gtk.StringList.new(["PC webcam", "Phone (Swivel Cam app)"]))
+        srcs = ["/dev/video0", "phone", "both"]
+        src_row = Adw.ComboRow(title="Camera source",
+                               subtitle="PC webcam, the Swivel Cam phone app (USB or WiFi), or both together",
+                               model=Gtk.StringList.new(["PC webcam", "Phone (Swivel Cam app)", "Both"]))
         src_want = srcs.index(self.cfg.get("cam_device")) if self.cfg.get("cam_device") in srcs else 0
         src_row.set_selected(src_want)
 
@@ -1107,7 +1179,7 @@ class Window(Adw.ApplicationWindow):
         else:
             secs, msg = 0.7, "Hold it"
         self.engine.calib_sink = []
-        self.cam_samples = []
+        self.cam_samples = {}
         t0 = time.monotonic()
 
         def tick():
@@ -1140,14 +1212,17 @@ class Window(Adw.ApplicationWindow):
     def _calib_take(self, name):
         self.results[name] = self.engine.calib_sink or []
         self.engine.calib_sink = None
-        self.results["cam_" + name] = list(self.cam_samples or [])
+        self.results["cam_" + name] = {k: list(v) for k, v in (self.cam_samples or {}).items()}
         self.cam_samples = None
 
     def _cam_sample(self):
         # record raw webcam angles while a pose is being measured
         e = self.engine
-        if self.cam_samples is not None and e.cam_raw is not None and e.cam:
-            self.cam_samples.append(e.cam_raw)
+        if self.cam_samples is not None:
+            now = time.monotonic()
+            for name, src in list(e.srcs.items()):
+                if src.raw and src.last and now - src.raw[0] < 0.2:
+                    self.cam_samples.setdefault(name, []).append(src.raw[1:])
         return self.calib_stage is not None
 
     def _calib_abort(self, msg):
@@ -1197,29 +1272,43 @@ class Window(Adw.ApplicationWindow):
         cue("complete", "Calibrated. Look at the screen.", clip="calib-done")
 
     def _calib_cam_signs(self, hp_yaw, hp_pitch):
-        """Learn the webcam's direction and scale: webcam degrees -> headphone degrees."""
-        still, up, right = (self.results.get(k) for k in ("cam_still", "cam_up", "cam_right"))
-        dbg = {"cam_samples": [len(x or []) for x in (still, up, right)], "hp_yaw": hp_yaw, "hp_pitch": hp_pitch}
+        """Learn each camera's direction and scale: camera degrees -> headphone degrees."""
+        dbg = {"hp_yaw": hp_yaw, "hp_pitch": hp_pitch}
         dbg_path = Path(GLib.get_user_cache_dir()) / "swivel/last-calibration.json"
         dbg_path.parent.mkdir(parents=True, exist_ok=True)
-        dbg_path.write_text(json.dumps(dbg))
-        if not still or not up or not right:
-            return "Webcam not calibrated: it didn't see your face during calibration"
-        base = (sum(v[0] for v in still) / len(still), sum(v[1] for v in still) / len(still))
-        dy = sum(v[0] for v in right) / len(right) - base[0]
-        dp = sum(v[1] for v in up) / len(up) - base[1]
-        dbg.update(cam_dyaw=dy, cam_dpitch=dp)
-        dbg_path.write_text(json.dumps(dbg))
-        if abs(dy) < 5 or abs(dp) < 5:
-            return "Webcam not calibrated: turn further"
+        names = set()
+        for k in ("cam_still", "cam_up", "cam_right"):
+            names |= set((self.results.get(k) or {}).keys())
+        done, msgs = [], []
 
         def gain(hp, cam):
             g = (hp / cam) if hp else (1.0 if cam > 0 else -1.0)
             return g if 0.4 <= abs(g) <= 2.5 else (1.0 if g > 0 else -1.0)
 
-        self.set_cfg("cam_sign", [gain(hp_yaw, dy), gain(hp_pitch, dp)])
-        self.engine.cam_want_recenter = True
-        return "Webcam calibrated"
+        gains = dict(self.cfg.get("cam_gain") or {})
+        for name in sorted(names):
+            still, up, right = ((self.results.get(k) or {}).get(name) for k in ("cam_still", "cam_up", "cam_right"))
+            label = {"pc": "Webcam", "phone": "Phone"}.get(name, name)
+            dbg[name] = {"samples": [len(x or []) for x in (still, up, right)]}
+            if not still or not up or not right:
+                msgs.append(f"{label} didn't see your face")
+                continue
+            base = (sum(v[0] for v in still) / len(still), sum(v[1] for v in still) / len(still))
+            dy = sum(v[0] for v in right) / len(right) - base[0]
+            dp = sum(v[1] for v in up) / len(up) - base[1]
+            dbg[name].update(dyaw=dy, dpitch=dp)
+            if abs(dy) < 5 or abs(dp) < 5:
+                msgs.append(f"{label}: turn further")
+                continue
+            gains[name] = [gain(hp_yaw, dy), gain(hp_pitch, dp)]
+            done.append(label)
+        dbg_path.write_text(json.dumps(dbg))
+        if done:
+            self.set_cfg("cam_gain", gains)
+            self.engine.cam_want_recenter = True
+        if not names:
+            return ""
+        return ", ".join(([f"{' and '.join(done)} calibrated"] if done else []) + msgs)
 
     @staticmethod
     def _measure_bias(samples):

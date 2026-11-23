@@ -42,9 +42,14 @@ data class Pose(val yaw: Double, val pitch: Double, val roll: Double, val valid:
  * (Swivel runs it) makes 127.0.0.1:4244 on the phone reach the PC. Packet = 7
  * little-endian doubles: x, y, z, yaw, pitch, roll, valid (same as swivel_cam.py).
  */
-class Streamer(private val host: String = "127.0.0.1", private val port: Int = 4244) {
+class Streamer(private val port: Int = 4244) {
     @Volatile var connected = false
         private set
+    /** "USB" or "WiFi" while connected. */
+    @Volatile var link = ""
+        private set
+    /** The PC's WiFi address, handed over by Swivel through adb; used when USB is unavailable. */
+    @Volatile var wifiHost: String? = null
     @Volatile private var latest: Pose? = null
     @Volatile private var running = true
     private val lock = Object()
@@ -61,12 +66,17 @@ class Streamer(private val host: String = "127.0.0.1", private val port: Int = 4
 
     fun start() = Thread {
         val buf = ByteBuffer.allocate(56).order(ByteOrder.LITTLE_ENDIAN)
+        var useWifi = false
         while (running) {
+            // try USB (adb reverse to 127.0.0.1) first, then WiFi, alternating on failure
+            val host = if (useWifi) wifiHost else "127.0.0.1"
+            if (host == null) { useWifi = false; Thread.sleep(300); continue }
             try {
                 Socket().use { s ->
                     s.tcpNoDelay = true
-                    s.connect(InetSocketAddress(host, port), 1000)
+                    s.connect(InetSocketAddress(host, port), 800)
                     connected = true
+                    link = if (useWifi) "WiFi" else "USB"
                     val out: OutputStream = s.getOutputStream()
                     while (running) {
                         val p = synchronized(lock) {
@@ -85,7 +95,9 @@ class Streamer(private val host: String = "127.0.0.1", private val port: Int = 4
                 }
             } catch (e: Exception) {
                 connected = false
-                Thread.sleep(1000)
+                link = ""
+                useWifi = !useWifi
+                Thread.sleep(300)
             }
         }
         connected = false
