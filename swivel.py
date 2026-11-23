@@ -587,15 +587,23 @@ class Engine:
         """Combined camera view (time, yaw, pitch): the cameras that see the head now, each
         weighted by how squarely it sees the face."""
         now = time.monotonic()
-        fresh = [(s.last, max(s.w, 1e-3)) for s in self.srcs.values() if s.last and now - s.last[0] < CAM_STALE]
-        if not fresh:
+        srcs = [s for s in self.srcs.values() if s.last and now - s.last[0] < CAM_STALE]
+        if not srcs:
             return None
+        fresh = [(s.last, max(s.w, 1e-3)) for s in srcs]
         if len(fresh) > 1:
             spread = max(max(f[1] for f, _ in fresh) - min(f[1] for f, _ in fresh),
                          max(f[2] for f, _ in fresh) - min(f[2] for f, _ in fresh))
             if spread > CAM_DISAGREE:
-                # one camera is misreading: keep the one with the more frontal view
-                fresh = [max(fresh, key=lambda fw: fw[1])]
+                # one camera is misreading: keep the one with the more frontal view, and stay
+                # with it until the other is clearly better, so the output never flip-flops
+                pick = getattr(self, "cam_pick", None)
+                best = max(srcs, key=lambda s: s.w)
+                cur = next((s for s in srcs if s.name == pick), None)
+                if cur is None or best.w > cur.w + 0.15:
+                    cur = best
+                self.cam_pick = cur.name
+                fresh = [(cur.last, max(cur.w, 1e-3))]
         tw = sum(w for _, w in fresh)
         self.cam_trust = max(w for _, w in fresh)
         return (max(f[0] for f, _ in fresh), sum(f[1] * w for f, w in fresh) / tw,
