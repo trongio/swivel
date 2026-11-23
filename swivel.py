@@ -43,12 +43,16 @@ PIDFILE = Path(GLib.get_user_runtime_dir()) / "swivel.pid"
 HID_UUID = "00001124-0000-1000-8000-00805f9b34fb"
 DEFAULTS = {"yaw_max": 35.0, "pitch_max": 20.0, "deadzone": 0.5, "curve": 1.0,
             "anti_deadzone": 0.2, "smooth": 0.35, "invert_yaw": False,
-            "invert_pitch": False, "pad": "xbox", "tracker": ""}
+            "invert_pitch": False, "pad": "xbox", "tracker": "", "drift": 0.5}
 HISTORY_SECONDS = 10.0
 # Headsets send ~25 reports/s. If they go quiet this long, restart the tracker (it
 # re-enables the sensor). Restarts talk to the headset over Bluetooth, so keep them
 # rare: back off up to STALL_MAX_SECONDS, or a busy link can drop entirely.
 STALL_SECONDS = 2.0
+# Drift correction: yaw comes from a gyro with no compass, so "straight ahead" slowly
+# slides. While the head is near center and fairly still, ease the center toward it.
+DRIFT_WINDOW_DEG = 15.0
+DRIFT_MAX_SPEED_DPS = 25.0
 STALL_MAX_SECONDS = 30.0
 DEMO = bool(os.environ.get("SWIVEL_DEMO"))
 if DEMO:
@@ -177,6 +181,7 @@ class Engine:
         self.restarts = 0
         self.fail_streak = 0
         self.reanchor = False
+        self.prev_pkt = None  # (time, yaw) for head speed
 
     def shape(self, deg, max_deg):
         dz = self.cfg["deadzone"]
@@ -186,6 +191,22 @@ class Engine:
         x = min(mag / max(max_deg - dz, 1e-3), 1.0) ** self.cfg["curve"]
         ad = self.cfg["anti_deadzone"]  # jump past the game's own stick deadzone
         return math.copysign(ad + (1 - ad) * x, deg)
+
+    def _correct_drift(self, now):
+        strength = self.cfg.get("drift", 0.5)
+        prev, self.prev_pkt = self.prev_pkt, (now, self.yaw)
+        if strength <= 0 or prev is None:
+            return
+        dt = now - prev[0]
+        if not 0 < dt < 0.5:
+            return
+        speed = abs((self.yaw - prev[1] + 180) % 360 - 180) / dt
+        if abs(self.yaw) < DRIFT_WINDOW_DEG and speed < DRIFT_MAX_SPEED_DPS:
+            # time constant: 8 s at strength 0.5, 4 s at 1.0
+            k = min(1.0, dt * strength / 4.0)
+            shift = self.yaw * k
+            self.center = (self.center[0] + shift, self.center[1], self.center[2])
+            self.yaw -= shift
 
     def start(self):
         tracker = find_tracker(self.cfg.get("tracker"))
@@ -291,6 +312,7 @@ class Engine:
                         self.center = (yaw - self.yaw, pitch - self.pitch, roll - self.roll)
                         self.reanchor = False
                     self.yaw = (yaw - self.center[0] + 180) % 360 - 180
+                    self._correct_drift(now)
                     self.pitch = pitch - self.center[1]
                     self.roll = (roll - self.center[2] + 180) % 360 - 180
                     tx = self.shape(self.yaw, c["yaw_max"]) * (-1 if c["invert_yaw"] else 1)
@@ -483,6 +505,9 @@ class Window(Adw.ApplicationWindow):
                    "anti_deadzone", 0, 0.5, 0.01, 2)
         self._spin(tune, "Curve", "Above 1 gives finer control near center", "curve", 1, 3, 0.1, 1)
         self._spin(tune, "Smoothing", "Higher is smoother but adds lag", "smooth", 0, 0.9, 0.05, 2)
+        self._spin(tune, "Drift correction",
+                   "Slowly re-centers left/right while you look roughly ahead. 0 turns it off",
+                   "drift", 0, 1, 0.1, 1)
 
         ctl = Adw.PreferencesGroup(title="Controller")
         kinds = ["playstation", "xbox"]

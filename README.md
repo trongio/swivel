@@ -24,7 +24,9 @@ both.
   moves, so it doesn't keep stealing the "active controller" from your real pad
 - Connects the headset's head-tracking channel automatically (most Sony headsets
   connect for audio only)
-- Recenter button, plus a signal for a keyboard shortcut
+- Recenter button and keyboard shortcut, plus automatic drift correction: the
+  headset's yaw comes from a gyro with no compass, so center slowly slides; Swivel
+  eases it back while you look roughly ahead
 - Demo mode with simulated motion: `SWIVEL_DEMO=1 python3 swivel.py`
 
 ## How it works
