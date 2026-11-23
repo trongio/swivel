@@ -1034,7 +1034,11 @@ class Window(Adw.ApplicationWindow):
         header.pack_end(self.toggle)
 
         self.status = Gtk.Label(label="Stopped", css_classes=["title-4"])
-        self.readout = Gtk.Label(label="", css_classes=["dim-label", "numeric"])
+        # fixed-width text that can't ask for more room, so the window never breathes
+        self.readout = Gtk.Label(label="", css_classes=["dim-label", "monospace"],
+                                 ellipsize=Pango.EllipsizeMode.END)
+        self.camline = Gtk.Label(label="", css_classes=["dim-label", "caption"],
+                                 ellipsize=Pango.EllipsizeMode.END)
 
         self.stick = Canvas(self.draw_stick, 230, 230)
         self.model = Canvas(self.draw_model, 300, 230, hexpand=True)
@@ -1064,7 +1068,7 @@ class Window(Adw.ApplicationWindow):
 
         live = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=12, margin_bottom=6)
         for w in (self.status, row, self._titled(f"Last {HISTORY_SECONDS:.0f} seconds", self.graph),
-                  self.readout, buttons):
+                  self.readout, self.camline, buttons):
             live.append(w)
 
         tune = Adw.PreferencesGroup(title="Tuning", description="Head angle for full stick, and feel")
@@ -1453,12 +1457,11 @@ class Window(Adw.ApplicationWindow):
             e.stop(keep_status=True)
             self.toggle.set_active(False)
         self.status.set_label(self.calib_msg or e.status)
-        cam = ""
-        if e.running and e.mode() != "off":
-            cam = f"    ·    {e.cam_status}"
-            if e.cam and e.mode() == "assist":
-                cam += f" (yaw {e.cam[1]:+.0f}°, pitch {e.cam[2]:+.0f}°)"
-        self.readout.set_label(f"yaw {e.yaw:+6.1f}°    pitch {e.pitch:+6.1f}°    roll {e.roll:+6.1f}°{cam}")
+        cams = e.running and e.mode() != "off"
+        cam = (f"   cameras {e.cam[1]:+6.1f}° {e.cam[2]:+6.1f}°" if cams and e.cam and e.mode() == "assist"
+               else " " * 26)
+        self.readout.set_label(f"yaw {e.yaw:+6.1f}°   pitch {e.pitch:+6.1f}°   roll {e.roll:+6.1f}°{cam}")
+        self.camline.set_label(e.cam_status if cams else "")
         for w in (self.stick, self.model, self.graph):
             w.queue_draw()
         return True
