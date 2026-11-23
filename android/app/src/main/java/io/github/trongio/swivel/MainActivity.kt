@@ -22,6 +22,8 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.MaterialTheme
@@ -41,6 +43,7 @@ import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
 import java.util.concurrent.Executors
 
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 class MainActivity : ComponentActivity() {
     private val analysisExecutor = Executors.newSingleThreadExecutor()
     private val streamer = Streamer()
@@ -118,9 +121,11 @@ class MainActivity : ComponentActivity() {
         var connected by remember { mutableStateOf(false) }
         LaunchedEffect(Unit) { while (true) { connected = streamer.connected; delay(300) } }
         MaterialTheme(colorScheme = darkColorScheme()) {
-            Row(Modifier.fillMaxSize().background(Color(0xFF1E1E1E)).padding(16.dp),
-                horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                Box(Modifier.fillMaxHeight().width(360.dp)) {
+            val portrait = androidx.compose.ui.platform.LocalConfiguration.current.orientation ==
+                android.content.res.Configuration.ORIENTATION_PORTRAIT
+            androidx.compose.foundation.layout.FlowRow(Modifier.fillMaxSize().background(Color(0xFF1E1E1E)).padding(16.dp),
+                horizontalArrangement = Arrangement.spacedBy(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                Box(if (portrait) Modifier.fillMaxWidth().height(420.dp) else Modifier.fillMaxHeight().width(360.dp)) {
                     AndroidView(factory = { ctx ->
                         PreviewView(ctx).also { previewView = it; if (hasCamera) startCamera() }
                     }, modifier = Modifier.fillMaxSize())

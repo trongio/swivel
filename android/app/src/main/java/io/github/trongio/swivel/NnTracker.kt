@@ -31,10 +31,11 @@ class NnTracker(context: Context, private val onPose: (Pose, Long) -> Unit) {
         private set
     private val useMirror = false  // averaging with the mirrored crop: steadier, but doubles inference time
 
-    private val fw = 640
-    private val fh = 360
-    private val gray = FloatArray(fw * fh)
-    private val pixels = IntArray(fw * fh)
+    // working frame: long side 640 px, either orientation (phone upright or sideways)
+    private var fw = 640
+    private var fh = 360
+    private var gray = FloatArray(fw * fh)
+    private var pixels = IntArray(fw * fh)
 
     init {
         fun session(name: String): OrtSession {
@@ -66,11 +67,16 @@ class NnTracker(context: Context, private val onPose: (Pose, Long) -> Unit) {
         try {
             val rot = image.imageInfo.rotationDegrees
             val src = image.toBitmap()
-            val scaled = if (rot % 180 == 0) Bitmap.createScaledBitmap(src, fw, fh, true)
-            else Bitmap.createScaledBitmap(src, fh, fw, true)
-            val frame = if (rot == 0) scaled else Bitmap.createBitmap(scaled, 0, 0, scaled.width, scaled.height,
+            val k = 640f / max(src.width, src.height)
+            val sw = (src.width * k).toInt(); val sh = (src.height * k).toInt()
+            val scaled = Bitmap.createScaledBitmap(src, sw, sh, true)
+            val frame = if (rot == 0) scaled else Bitmap.createBitmap(scaled, 0, 0, sw, sh,
                 Matrix().apply { postRotate(rot.toFloat()) }, true)
-            if (frame.width != fw || frame.height != fh) return  // portrait: unsupported, keep landscape
+            if (frame.width != fw || frame.height != fh) {  // orientation changed
+                fw = frame.width; fh = frame.height
+                gray = FloatArray(fw * fh); pixels = IntArray(fw * fh)
+                box = null
+            }
             frame.getPixels(pixels, 0, fw, 0, 0, fw, fh)
             for (i in pixels.indices) {
                 val p = pixels[i]
