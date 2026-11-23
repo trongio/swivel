@@ -11,7 +11,8 @@ angles); "mediapipe" uses MediaPipe Face Landmarker.
 
 Streams UDP packets to Swivel (127.0.0.1:4243 by default): 7 little-endian
 doubles = x, y, z (cm, head position), yaw, pitch, roll (degrees), valid (1/0).
-Video never leaves this process; only the angles are sent.
+With --preview PORT, a small JPEG of the view with the tracked head box is also sent to
+127.0.0.1:PORT about 10 times a second for Swivel's preview. Nothing leaves this computer.
 """
 import argparse
 import math
@@ -178,6 +179,7 @@ def main():
     ap.add_argument("--raw", action="store_true", help="disable smoothing")
     ap.add_argument("--backend", choices=["opentrack", "mediapipe"], default="opentrack")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--preview", type=int, default=0, help="send a JPEG preview to this local UDP port")
     a = ap.parse_args()
 
     cap = cv2.VideoCapture(a.device, cv2.CAP_V4L2)
@@ -243,6 +245,7 @@ def run_opentrack(cap, a):
     print(f"webcam {a.device} (opentrack nn) streaming to 127.0.0.1:{a.port}", file=sys.stderr, flush=True)
     filters = [OneEuro() for _ in range(3)]
     last_t = None
+    prev_t = 0.0
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -261,8 +264,29 @@ def run_opentrack(cap, a):
             filters = [OneEuro() for _ in range(3)]
             last_t = None
         sock.sendto(struct.pack("<7d", *pkt), dest)
+        if a.preview and time.monotonic() - prev_t > 0.1:
+            prev_t = time.monotonic()
+            send_preview(sock, a.preview, frame, nn.box, ang)
         if a.verbose:
             print("yaw %+6.1f pitch %+6.1f roll %+6.1f face %d" % (*pkt[3:6], pkt[6]), flush=True)
+
+
+def send_preview(sock, port, frame, box, ang):
+    """Mirrored thumbnail with the head box, as one JPEG datagram."""
+    h, w = frame.shape[:2]
+    k = 360 / w
+    img = cv2.resize(frame, (360, int(h * k)), interpolation=cv2.INTER_AREA)
+    if box is not None:
+        bx, by, bw, bh = (v * k for v in box)
+        color = (137, 227, 87) if ang is not None else (45, 210, 246)
+        cv2.rectangle(img, (int(bx), int(by)), (int(bx + bw), int(by + bh)), color, 2)
+    img = cv2.flip(img, 1)  # like a mirror, so moving left moves left
+    ok, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    if ok and len(jpg) < 60000:
+        try:
+            sock.sendto(jpg.tobytes(), ("127.0.0.1", port))
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

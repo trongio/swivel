@@ -247,6 +247,7 @@ class OneEuro:
 CAM_PORT = 4243  # PC webcam helper -> Swivel (UDP)
 PHONE_PORT = 4244  # Swivel Cam app -> Swivel (TCP; USB via adb reverse, or WiFi)
 PHONE_UDP_PORT = 4245  # internal: relayed phone packets
+PREVIEW_PORT = 4246  # webcam helper -> Swivel: JPEG thumbnails with the head box
 
 
 def lan_ip():
@@ -301,6 +302,28 @@ def frontal_weight(yaw, pitch):
     looking past it (a camera below sees mostly chin when you look up)."""
     a = math.hypot(yaw, pitch)
     return 0.0 if a > 60 else 1.0 / (1.0 + (a / CAM_FRONTAL) ** 4)
+
+
+V4L2_ZOOM = 0x9A090D  # V4L2_CID_ZOOM_ABSOLUTE
+V4L2_TILT = 0x9A0909  # V4L2_CID_TILT_ABSOLUTE (arc seconds)
+V4L2_PAN = 0x9A0908  # V4L2_CID_PAN_ABSOLUTE
+
+
+def v4l2_ctrl(device, cid, value=None):
+    """Read, or set, a webcam control (zoom, pan, tilt). Returns the value, or None."""
+    req = 27 if value is None else 28  # VIDIOC_G_CTRL / VIDIOC_S_CTRL
+    buf = bytearray(struct.pack("<Ii", cid, int(value or 0)))
+    try:
+        fd = os.open(device, os.O_RDWR | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        fcntl.ioctl(fd, (3 << 30) | (8 << 16) | (ord("V") << 8) | req, buf)
+        return struct.unpack("<Ii", buf)[1]
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
 
 
 def find_uv():
@@ -508,10 +531,31 @@ class Engine:
         src = self._add_source("pc", CAM_PORT)
         src.log = open(Path(GLib.get_user_runtime_dir()) / "swivel-webcam.log", "w")
         src.proc = subprocess.Popen(
-            [uv, "run", "--quiet", "--script", str(helper), "--device", device, "--port", str(CAM_PORT)],
+            [uv, "run", "--quiet", "--script", str(helper), "--device", device, "--port", str(CAM_PORT),
+             "--preview", str(PREVIEW_PORT)],
             stdout=subprocess.DEVNULL, stderr=src.log)
         src.status = "starting"
         src.thread.start()
+        threading.Thread(target=self._preview_loop, args=(src,), daemon=True).start()
+
+    def _preview_loop(self, src):
+        """Keep the latest webcam thumbnail for the window."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.bind(("127.0.0.1", PREVIEW_PORT))
+        except OSError:
+            return
+        sock.settimeout(0.5)
+        try:
+            while self.running and src.proc:
+                try:
+                    data = sock.recv(65536)
+                except (socket.timeout, OSError):
+                    continue
+                self.preview = (time.monotonic(), data)
+        finally:
+            sock.close()
+            self.preview = None
 
     def _start_phone(self):
         """Swivel Cam app: over USB (adb reverse) when connected, otherwise over WiFi."""
@@ -1088,6 +1132,12 @@ class Window(Adw.ApplicationWindow):
         row = Gtk.Box(spacing=18, halign=Gtk.Align.FILL)
         row.append(self._titled("Right stick", self.stick))
         row.append(self._titled("Headphones", self.model))
+        self.picture = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, can_shrink=True,
+                                   width_request=300, height_request=230)
+        self.webcam_box = self._titled("Webcam", self.picture)
+        self.webcam_box.set_visible(False)
+        row.append(self.webcam_box)
+        self.preview_t = 0.0
 
         recenter = Gtk.Button(label="Recenter", css_classes=["pill", "suggested-action"],
                               halign=Gtk.Align.CENTER)
@@ -1171,6 +1221,12 @@ class Window(Adw.ApplicationWindow):
 
         GLib.idle_add(hook_src_row)
         ctl.add(src_row)
+        self._cam_ctrl_row(ctl, "Webcam zoom", "Narrower view, bigger face. 1.0 shows the whole room",
+                           V4L2_ZOOM, 100, 1.0, 4.0, 0.1, 1)
+        self._cam_ctrl_row(ctl, "Webcam tilt", "Moves the zoomed view up or down (degrees)",
+                           V4L2_TILT, 3600, -10, 10, 1, 0)
+        self._cam_ctrl_row(ctl, "Webcam pan", "Moves the zoomed view left or right (degrees)",
+                           V4L2_PAN, 3600, -10, 10, 1, 0)
         self._switch(ctl, "Ignore head tilt (roll)", "ignore_roll")
         self.inv_rows = {k: self._switch(ctl, t, k) for t, k in
                          (("Invert yaw", "invert_yaw"), ("Invert pitch", "invert_pitch"))}
@@ -1210,6 +1266,21 @@ class Window(Adw.ApplicationWindow):
         row.set_digits(digits)
         row.set_value(self.cfg[key])
         row.connect("notify::value", lambda r, _p: self.set_cfg(key, r.get_value()))
+        group.add(row)
+
+    def _cam_ctrl_row(self, group, title, sub, cid, *spec):
+        """A live webcam control. spec: (device units per shown unit, lo, hi, step, digits)."""
+        scale, lo, hi, step, digits = spec
+        dev = "/dev/video0"
+        cur = v4l2_ctrl(dev, cid)
+        if cur is None:
+            return
+        row = Adw.SpinRow.new_with_range(lo, hi, step)
+        row.set_title(title)
+        row.set_subtitle(sub)
+        row.set_digits(digits)
+        row.set_value(cur / scale)
+        row.connect("notify::value", lambda r, _p: v4l2_ctrl(dev, cid, round(r.get_value() * scale)))
         group.add(row)
 
     def _switch(self, group, title, key):
@@ -1494,6 +1565,16 @@ class Window(Adw.ApplicationWindow):
 
     def tick(self):
         e = self.engine
+        pv = getattr(e, "preview", None) if e.running else None
+        if pv and pv[0] != self.preview_t and time.monotonic() - pv[0] < 1.0:
+            self.preview_t = pv[0]
+            try:
+                self.picture.set_paintable(Gdk.Texture.new_from_bytes(GLib.Bytes.new(pv[1])))
+                self.webcam_box.set_visible(True)
+            except GLib.Error:
+                pass
+        elif self.webcam_box.get_visible() and (not pv or time.monotonic() - pv[0] > 2.0):
+            self.webcam_box.set_visible(False)
         if DEMO and not e.running:
             self.demo_step()
         if not e.running and e.pad is not None:  # tracker died: clean up, keep its message
