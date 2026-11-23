@@ -457,6 +457,7 @@ class Engine:
     def _start_phone(self):
         """Use the Swivel Cam Android app over USB: adb reverse + a TCP relay into the cam pipeline."""
         adb = shutil.which("adb") or str(Path.home() / "Android/Sdk/platform-tools/adb")
+        self.adb = adb
         try:
             subprocess.run([adb, "reverse", f"tcp:{PHONE_PORT}", f"tcp:{PHONE_PORT}"], capture_output=True, timeout=10)
             subprocess.run([adb, "shell", "am", "start", "-n",
@@ -480,8 +481,17 @@ class Engine:
         srv.listen(1)
         srv.settimeout(0.5)
         out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        last_fix = 0.0
         try:
             while self.running:
+                # USB reconnects drop the adb forwarding; restore it every few seconds
+                if time.monotonic() - last_fix > 3:
+                    last_fix = time.monotonic()
+                    try:
+                        subprocess.run([self.adb, "reverse", f"tcp:{PHONE_PORT}", f"tcp:{PHONE_PORT}"],
+                                       capture_output=True, timeout=5)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
                 try:
                     conn, _ = srv.accept()
                 except socket.timeout:
