@@ -765,7 +765,7 @@ class Engine:
         ey, ep = hy - cy, hp - cp
         self._learn_xtalk(now, hy, hp, ey, ep)
         # the XM5 sometimes re-zeroes itself: a big, lasting disagreement is a jump, not drift
-        if math.hypot(ey, ep) > CAM_SNAP_DEG:
+        if math.hypot(ey, ep) > CAM_SNAP_DEG and speed < 20 and getattr(self, "cam_trust", 0) > 0.8:
             self.big_err_since = getattr(self, "big_err_since", None) or now
             if now - self.big_err_since > CAM_SNAP_S:
                 k = 1.0
