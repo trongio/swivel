@@ -33,13 +33,25 @@ both.
   uses OpenTrack's neural-net head-pose model (tracks to ~65 degrees; MediaPipe is
   available with --backend mediapipe) as a drift-free reference and slowly pulls the
   headphones' center back while your head is still; *Control* steers the camera with
-  your face alone, no headphones needed. Video stays in the local helper process;
-  only head angles reach Swivel
+  your face alone, no headphones needed. Video stays on this computer: the helper sends
+  Swivel head angles plus a small preview image over localhost
+  - In drift correction the headphones drive the stick (fast, smooth) and the camera only
+    corrects the center, at any angle, matched to the camera's measured lag (about 100 ms)
+  - If the headset re-zeroes itself or its Bluetooth stream drops out, the webcam steers
+    until it's back, then lines the headset up with the camera right away
+  - Camera poses are corrected for where your head is in the frame (leaning or sliding
+    no longer reads as turning) and use the nose direction, so tilting your head doesn't
+    move yaw or pitch
+  - Learns from the camera if turning makes the headset read slightly up or down, and
+    removes it
+  - Live webcam preview with the tracked head box, and webcam zoom / tilt / pan controls
 - **Phone as a camera**: the Swivel Cam Android app (`android/`) runs OpenTrack's
   head-pose network on the phone (Snapdragon NPU via ONNX Runtime QNN, CPU fallback) and
   streams head angles over USB (`adb reverse`), falling back to WiFi (TCP 4244; allow it
   in your firewall). *Camera source: Both* averages the PC webcam and the phone, each
-  calibrated separately. Build with `cd android && ./gradlew assembleDebug`
+  calibrated separately, weighted by how squarely each one sees your face (a camera
+  below you sees mostly chin when you look up, so the one above takes over). Build with
+  `cd android && ./gradlew assembleDebug`
 - Connects the headset's head-tracking channel automatically (most Sony headsets
   connect for audio only)
 - Recenter button and keyboard shortcut, plus automatic drift correction: the
