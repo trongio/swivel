@@ -758,6 +758,21 @@ class Canvas(Gtk.Widget):
         self.draw(self, Painter(snapshot, self), self.get_width(), self.get_height())
 
 
+# ---- sound cues ---------------------------------------------------------------------
+SOUND_DIR = Path("/usr/share/sounds/freedesktop/stereo")
+
+
+def cue(sound=None, say=None):
+    """Play a short freedesktop sound and/or speak a phrase, without blocking."""
+    if sound:
+        f = SOUND_DIR / f"{sound}.oga"
+        player = shutil.which("paplay") or shutil.which("pw-play")
+        if player and f.exists():
+            subprocess.Popen([player, str(f)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if say and shutil.which("spd-say"):
+        subprocess.Popen(["spd-say", "-r", "10", say], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 # ---- UI -------------------------------------------------------------------------------
 class Window(Adw.ApplicationWindow):
     def __init__(self, app, engine):
@@ -787,9 +802,15 @@ class Window(Adw.ApplicationWindow):
         calibrate = Gtk.Button(label="Calibrate", css_classes=["pill"],
                                tooltip_text="Teach Swivel which way is up and right for how you wear the headset")
         calibrate.connect("clicked", lambda *_: self.start_calibration())
+        self.calib_button = calibrate
+        self.cancel_button = Gtk.Button(label="Cancel", css_classes=["pill", "flat"], visible=False)
+        self.cancel_button.connect("clicked", lambda *_: self._calib_abort("Calibration cancelled"))
+        self.calib_stage = None
+        self.calib_busy = False
         buttons = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER)
         buttons.append(recenter)
         buttons.append(calibrate)
+        buttons.append(self.cancel_button)
         self.calib_steps = None
         self.calib_msg = None
 
@@ -904,37 +925,86 @@ class Window(Adw.ApplicationWindow):
         self.engine.want_recenter = True
         self._update_axes_row()
 
+    # Calibration is a short wizard: Swivel says where to look, you look there and
+    # press Next (or F8 / `swivel --recenter`, which works while a game has focus).
+    CALIB_PROMPTS = {
+        "still": "Look straight at the screen, then press Next (or F8)",
+        "up": "Look UP and hold it, then press Next (or F8)",
+        "right": "Look RIGHT and hold it, then press Next (or F8)",
+    }
+    CALIB_ORDER = ["still", "up", "right"]
+    CALIB_SPOKEN = {
+        "still": "Look straight at the screen, then press F 8.",
+        "up": "Now look up and hold, then press F 8.",
+        "right": "Now look right and hold, then press F 8.",
+    }
+
     def start_calibration(self):
         e = self.engine
+        if self.calib_stage:
+            self.calib_next()
+            return
         if not e.running or not e.status.startswith("Tracking"):
             self._flash("Start tracking first, then press Calibrate")
             return
-        if self.calib_steps:
-            return
         self.results = {}
-        # (seconds, message, action at start, action at end)
-        self.calib_steps = [
-            (5.0, "Look straight at the screen and keep very still", self._calib_center_collect,
-             lambda: self._calib_take("still")),
-            (1.5, "Now look UP and hold", None, self._calib_collect),
-            (1.5, "Keep holding UP", None, lambda: self._calib_take("up")),
-            (1.5, "Now look RIGHT and hold", None, self._calib_collect),
-            (1.5, "Keep holding RIGHT", None, lambda: self._calib_take("right")),
-            (2.0, "Look straight at the screen again", None, self._calib_finish),
-        ]
-        e.calibrating = True
+        self.calib_stage = "still"
+        self.calib_busy = False
         self.cam_samples = None
+        e.calibrating = True
+        self.calib_steps = True  # keeps status messages pinned
+        self.calib_msg = self.CALIB_PROMPTS["still"]
+        cue(say=self.CALIB_SPOKEN["still"])
+        self.calib_button.set_label("Next")
+        self.cancel_button.set_visible(True)
         GLib.timeout_add(33, self._cam_sample)
-        self._calib_next()
 
-    def _calib_center_collect(self):
-        self.engine.want_recenter = True
+    def calib_next(self):
+        """Measure the current pose (button or F8)."""
+        if not self.calib_stage or self.calib_busy:
+            return
+        if not self.engine.running:
+            self._calib_abort("Calibration stopped: tracking is off")
+            return
+        stage = self.calib_stage
+        self.calib_busy = True
+        cue("audio-volume-change")
+        if stage == "still":
+            self.engine.want_recenter = True
+            secs, msg = 3.0, "Hold still"
+            cue(say="Hold still.")
+        else:
+            secs, msg = 0.7, "Hold it"
         self.engine.calib_sink = []
         self.cam_samples = []
+        t0 = time.monotonic()
 
-    def _calib_collect(self):
-        self.engine.calib_sink = []
-        self.cam_samples = []
+        def tick():
+            left = secs - (time.monotonic() - t0)
+            if not self.calib_stage:
+                return False
+            if left > 0:
+                self.calib_msg = f"{msg}…  ({math.ceil(left)})"
+                return True
+            self._calib_take(stage)
+            self.calib_busy = False
+            i = self.CALIB_ORDER.index(stage)
+            if i + 1 < len(self.CALIB_ORDER):
+                self.calib_stage = self.CALIB_ORDER[i + 1]
+                self.calib_msg = self.CALIB_PROMPTS[self.calib_stage]
+                cue("message", self.CALIB_SPOKEN[self.calib_stage])
+            else:
+                self._calib_end_ui()
+                self._calib_finish()
+            return False
+
+        GLib.timeout_add(100, tick)
+
+    def _calib_end_ui(self):
+        self.calib_stage = None
+        self.calib_steps = None
+        self.calib_button.set_label("Calibrate")
+        self.cancel_button.set_visible(False)
 
     def _calib_take(self, name):
         self.results[name] = self.engine.calib_sink or []
@@ -943,40 +1013,15 @@ class Window(Adw.ApplicationWindow):
         self.cam_samples = None
 
     def _cam_sample(self):
-        # record raw webcam angles during calibration holds
+        # record raw webcam angles while a pose is being measured
         e = self.engine
         if self.cam_samples is not None and e.cam_raw is not None and e.cam:
             self.cam_samples.append(e.cam_raw)
-        return self.calib_steps is not None
-
-    def _calib_next(self):
-        if not self.calib_steps:
-            return False
-        secs, msg, start, end = self.calib_steps[0]
-        if start:
-            start()
-        t0 = time.monotonic()
-
-        def step():
-            left = secs - (time.monotonic() - t0)
-            if left > 0 and self.engine.running:
-                self.calib_msg = f"{msg}  ({math.ceil(left)})"
-                return True
-            if not self.engine.running:
-                self._calib_abort("Calibration stopped: tracking is off")
-                return False
-            if end:
-                end()
-            if self.calib_steps:
-                self.calib_steps.pop(0)
-                self._calib_next()
-            return False
-
-        GLib.timeout_add(100, step)
-        return False
+        return self.calib_stage is not None
 
     def _calib_abort(self, msg):
-        self.calib_steps = None
+        cue("dialog-warning")
+        self._calib_end_ui()
         self.engine.calib_sink = None
         self.engine.calibrating = False
         self._flash(msg)
@@ -997,10 +1042,12 @@ class Window(Adw.ApplicationWindow):
         up, right = mean_rotvec(self.results.get("up", [])), mean_rotvec(self.results.get("right", []))
         mu, mr = math.sqrt(v_dot(up, up)), math.sqrt(v_dot(right, right))
         if mu < 8 or mr < 8:
+            cue("dialog-warning", "Calibration failed. Turn your head further and try again.")
             self._flash("Calibration failed: turn your head further (at least ~15°) and hold it")
             return
         pa, ya = v_norm(up), v_norm(right)
         if abs(v_dot(pa, ya)) > 0.9:
+            cue("dialog-warning", "Calibration failed. Try again.")
             self._flash("Calibration failed: up and right looked the same, try again")
             return
         self.set_cfg("pitch_axis", list(pa))
@@ -1015,15 +1062,22 @@ class Window(Adw.ApplicationWindow):
         self.engine.want_recenter = True
         self._update_axes_row()
         self._flash("Calibrated. Up/down and left/right now follow your head" + (f". {cam_msg}" if cam_msg else ""))
+        cue("complete", "Calibrated. Look at the screen.")
 
     def _calib_cam_signs(self, hp_yaw, hp_pitch):
         """Learn the webcam's direction and scale: webcam degrees -> headphone degrees."""
         still, up, right = (self.results.get(k) for k in ("cam_still", "cam_up", "cam_right"))
+        dbg = {"cam_samples": [len(x or []) for x in (still, up, right)], "hp_yaw": hp_yaw, "hp_pitch": hp_pitch}
+        dbg_path = Path(GLib.get_user_cache_dir()) / "swivel/last-calibration.json"
+        dbg_path.parent.mkdir(parents=True, exist_ok=True)
+        dbg_path.write_text(json.dumps(dbg))
         if not still or not up or not right:
-            return ""
+            return "Webcam not calibrated: it didn't see your face during calibration"
         base = (sum(v[0] for v in still) / len(still), sum(v[1] for v in still) / len(still))
         dy = sum(v[0] for v in right) / len(right) - base[0]
         dp = sum(v[1] for v in up) / len(up) - base[1]
+        dbg.update(cam_dyaw=dy, cam_dpitch=dp)
+        dbg_path.write_text(json.dumps(dbg))
         if abs(dy) < 5 or abs(dp) < 5:
             return "Webcam not calibrated: turn further"
 
@@ -1252,10 +1306,18 @@ class App(Adw.Application):
     def do_startup(self):
         Adw.Application.do_startup(self)
         PIDFILE.write_text(str(os.getpid()))
-        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1,
-                             lambda: setattr(self.engine, "want_recenter", True) or True)
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, self._on_usr1)
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, lambda: self.quit() or False)
+
+    def _on_usr1(self):
+        # F8 / `swivel --recenter`: confirms a calibration step, otherwise recenters
+        win = self.get_active_window()
+        if win is not None and getattr(win, "calib_stage", None):
+            win.calib_next()
+        else:
+            self.engine.want_recenter = True
+        return True
 
     def do_shutdown(self):
         self.engine.stop()

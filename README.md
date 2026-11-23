@@ -21,7 +21,8 @@ both.
 - PlayStation (default) or Xbox virtual controller. If your buttons get scrambled
   with Steam Input on, switch to Xbox. Swivel only sends input when your head moves,
   so it doesn't keep stealing the "active controller" from your real pad
-- **Calibrate** button: look straight, up, then right when prompted, and Swivel learns
+- **Calibrate** wizard: look straight, up, then right, pressing Next or F8 when you're
+  in position (spoken prompts and chimes, so it works with the game in front). Swivel learns
   how the headset's sensor sits on your head. Fixes nodding showing up as turning
   (or roll), which happens because the sensor in the ear cup is tilted. It also
   measures the gyro's constant creep while you hold still and cancels it
