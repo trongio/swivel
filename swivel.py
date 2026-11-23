@@ -45,7 +45,11 @@ DEFAULTS = {"yaw_max": 35.0, "pitch_max": 20.0, "deadzone": 0.5, "curve": 1.0,
             "anti_deadzone": 0.2, "smooth": 0.35, "invert_yaw": False,
             "invert_pitch": False, "pad": "playstation", "tracker": ""}
 HISTORY_SECONDS = 10.0
-STALL_SECONDS = 2.5  # headsets sometimes stop streaming; restart the tracker after this
+# Headsets send ~25 reports/s (gaps <= ~65 ms). If they go quiet for this long, restart
+# the tracker (it re-enables the sensor and streams again ~175 ms later). Backs off when
+# the headset really is gone, so it doesn't respawn in a tight loop.
+STALL_SECONDS = 0.3
+STALL_MAX_SECONDS = 3.0
 DEMO = bool(os.environ.get("SWIVEL_DEMO"))
 if DEMO:
     APP_ID += ".Demo"  # run alongside a real instance
@@ -171,6 +175,7 @@ class Engine:
         self.proc = self.pad = self.thread = self.sock = None
         self.errlog = None
         self.restarts = 0
+        self.fail_streak = 0
 
     def shape(self, deg, max_deg):
         dz = self.cfg["deadzone"]
@@ -188,7 +193,7 @@ class Engine:
         self.pad = VirtualPad(self.cfg.get("pad", "playstation"))
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("127.0.0.1", PORT))
-        self.sock.settimeout(0.1)
+        self.sock.settimeout(0.05)
         self.running = True
         self.want_recenter = True
         self.restarts = 0
@@ -260,10 +265,12 @@ class Engine:
                 self.status = "Tracker stopped: " + self._last_error(f"exit {self.proc.returncode}")
                 self.running = False
                 break
-            if time.monotonic() - max(self.last_packet, self.spawned) > STALL_SECONDS:
+            limit = min(STALL_SECONDS * 2 ** self.fail_streak, STALL_MAX_SECONDS)
+            if time.monotonic() - max(self.last_packet, self.spawned) > limit:
                 # The headset stopped streaming (sony-tracker just waits forever).
                 # A fresh tracker re-enables the sensor.
                 self.restarts += 1
+                self.fail_streak += 1
                 self.status = f"Headphones went quiet, restarting tracker ({self.restarts})…"
                 self._kill_proc()
                 if not sony_hidraw_present():
@@ -289,13 +296,15 @@ class Engine:
                     self.sx = k * self.sx + (1 - k) * tx
                     self.sy = k * self.sy + (1 - k) * ty
                     self.last_packet = now
+                    self.fail_streak = 0
                     self.status = "Tracking"
                     if not self.history or now - self.history[-1][0] >= 0.02:
                         self.history.append((now, self.yaw, self.pitch, self.roll))
-                else:
+                elif now - self.last_packet > 1.0:
+                    # hold the camera through short dropouts, recenter on long ones
                     self.sx *= 0.5
                     self.sy *= 0.5
-                    if now - self.last_packet > 1 and self.status == "Tracking":
+                    if self.status == "Tracking":
                         self.status = "No data from headphones"
                 self.pad.right_stick(self.sx, self.sy)
 
