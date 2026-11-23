@@ -45,6 +45,7 @@ DEFAULTS = {"yaw_max": 35.0, "pitch_max": 20.0, "deadzone": 0.5, "curve": 1.0,
             "anti_deadzone": 0.2, "smooth": 0.35, "invert_yaw": False,
             "invert_pitch": False, "pad": "playstation", "tracker": ""}
 HISTORY_SECONDS = 10.0
+STALL_SECONDS = 2.5  # headsets sometimes stop streaming; restart the tracker after this
 DEMO = bool(os.environ.get("SWIVEL_DEMO"))
 if DEMO:
     APP_ID += ".Demo"  # run alongside a real instance
@@ -168,6 +169,8 @@ class Engine:
         self.history = collections.deque(maxlen=1200)
         self.status = "Stopped"
         self.proc = self.pad = self.thread = self.sock = None
+        self.errlog = None
+        self.restarts = 0
 
     def shape(self, deg, max_deg):
         dz = self.cfg["deadzone"]
@@ -188,21 +191,45 @@ class Engine:
         self.sock.settimeout(0.1)
         self.running = True
         self.want_recenter = True
+        self.restarts = 0
+        self.last_packet = self.spawned = time.monotonic()
         self.status = "Connecting to headphones…"
         self.thread = threading.Thread(target=self._loop, args=(tracker,), daemon=True)
         self.thread.start()
 
-    def stop(self, keep_status=False):
-        self.running = False
-        if self.thread and self.thread is not threading.current_thread():
-            self.thread.join(2)
+    def _spawn(self, tracker):
+        # stderr goes to a file: a pipe nobody reads fills up and blocks the tracker
+        if self.errlog is None:
+            self.errlog = open(Path(GLib.get_user_runtime_dir()) / "swivel-tracker.log", "w+")
+        self.proc = subprocess.Popen([tracker], stdout=subprocess.DEVNULL, stderr=self.errlog)
+        self.spawned = time.monotonic()
+
+    def _last_error(self, default):
+        try:
+            self.errlog.seek(0)
+            lines = [ln.strip() for ln in self.errlog.read().splitlines() if ln.strip()]
+            return lines[-1] if lines else default
+        except (OSError, AttributeError):
+            return default
+
+    def _kill_proc(self):
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
             try:
                 self.proc.wait(2)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+                self.proc.wait()
         self.proc = None
+
+    def stop(self, keep_status=False):
+        self.running = False
+        if self.thread and self.thread is not threading.current_thread():
+            self.thread.join(2)
+        self._kill_proc()
+        if self.errlog:
+            self.errlog.close()
+            self.errlog = None
         if self.pad:
             self.pad.right_stick(0, 0)
             self.pad.close()
@@ -222,8 +249,7 @@ class Engine:
                 time.sleep(0.25)
         if not self.running:
             return
-        self.proc = subprocess.Popen([tracker], stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.PIPE, text=True)
+        self._spawn(tracker)
         self.status = "Waiting for headphones…"
         while self.running:
             try:
@@ -231,10 +257,18 @@ class Engine:
             except (socket.timeout, OSError):
                 data = None
             if self.proc.poll() is not None:
-                err = (self.proc.stderr.read() or "").strip().splitlines()
-                self.status = "Tracker stopped: " + (err[-1] if err else f"exit {self.proc.returncode}")
+                self.status = "Tracker stopped: " + self._last_error(f"exit {self.proc.returncode}")
                 self.running = False
                 break
+            if time.monotonic() - max(self.last_packet, self.spawned) > STALL_SECONDS:
+                # The headset stopped streaming (sony-tracker just waits forever).
+                # A fresh tracker re-enables the sensor.
+                self.restarts += 1
+                self.status = f"Headphones went quiet, restarting tracker ({self.restarts})…"
+                self._kill_proc()
+                if not sony_hidraw_present():
+                    connect_hid_profiles()
+                self._spawn(tracker)
             c = self.cfg
             with self.lock:
                 now = time.monotonic()
@@ -248,6 +282,9 @@ class Engine:
                     self.roll = (roll - self.center[2] + 180) % 360 - 180
                     tx = self.shape(self.yaw, c["yaw_max"]) * (-1 if c["invert_yaw"] else 1)
                     ty = self.shape(self.pitch, c["pitch_max"]) * (-1 if c["invert_pitch"] else 1)
+                    mag = math.hypot(tx, ty)
+                    if mag > 1:  # round gate, like a real stick
+                        tx, ty = tx / mag, ty / mag
                     k = c["smooth"]
                     self.sx = k * self.sx + (1 - k) * tx
                     self.sy = k * self.sy + (1 - k) * ty
