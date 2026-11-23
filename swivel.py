@@ -703,7 +703,13 @@ class Engine:
                 # stamped with when the head was there, not when the pose arrived
                 src.last = (now - CAM_LAG.get(src.name, 0.15), gy * (yaw - src.center[0]), gp * (pitch - src.center[1]))
                 src.status = "tracking"
-                if self.mode() == "control":
+                # headphones dropped out (Bluetooth hiccup, tracker restart): the webcam steers
+                # until they're back, instead of the view freezing
+                fallback = (self.mode() == "assist" and not self.calibrating and self.pad is not None
+                            and now - self.last_packet > 0.4)
+                if fallback:
+                    self.cam_fallback = now
+                if self.mode() == "control" or fallback:
                     _t, cy, cp = self.cam or src.last
                     if self.calib_sink is not None:
                         self.calib_sink.append((now, (cy, cp)))
@@ -712,8 +718,11 @@ class Engine:
                     dt = now - last if last and 0 < now - last < 0.5 else 1 / 30
                     self.ctl_last = now
                     self._set_target(dt)
-                    self.last_packet = now
-                    self.status = "Tracking (camera)"
+                    if fallback:
+                        self.status = "Headphones lost, steering with the webcam"
+                    else:
+                        self.last_packet = now
+                        self.status = "Tracking (camera)"
                     self._trace(now, 0.0)
                     if not self.history or now - self.history[-1][0] >= 0.02:
                         self.history.append((now, self.yaw, self.pitch, self.roll))
@@ -762,7 +771,19 @@ class Engine:
             if ht <= when:
                 hy, hp = y, p
                 break
+        if getattr(self, "force_snap", False):
+            hy, hp = self.yaw, self.pitch  # history is from before the dropout
         ey, ep = hy - cy, hp - cp
+        if getattr(self, "force_snap", False):
+            self.force_snap = False
+            self.snap_hold = now + 0.35
+            self.big_err_since = None
+            k = 1.0
+            ya, pa = self.axes()
+            self.qc = q_mul(q_mul(self.qc, q_axis_angle(ya, ey)), q_axis_angle(pa, ep))
+            self.yaw -= ey
+            self.pitch -= ep
+            return True
         self._learn_xtalk(now, hy, hp, ey, ep)
         # the XM5 sometimes re-zeroes itself: a big, lasting disagreement is a jump, not drift
         if math.hypot(ey, ep) > CAM_SNAP_DEG and speed < 20 and getattr(self, "cam_trust", 0) > 0.8:
@@ -924,6 +945,7 @@ class Engine:
                         # new tracker, new zero: keep the last relative orientation
                         self.qc = q_mul(q, q_conj(self.qr))
                         self.reanchor = False
+                        self.force_snap = True  # line up with the camera right away
                     self.qr = q_mul(q_conj(self.qc), q)
                     if self.calib_sink is not None:
                         self.calib_sink.append((now, self.qr))
@@ -943,7 +965,7 @@ class Engine:
                     self.status = "Tracking"
                     if not self.history or now - self.history[-1][0] >= 0.02:
                         self.history.append((now, self.yaw, self.pitch, self.roll))
-                elif now - self.last_packet > 1.0:
+                elif now - self.last_packet > 1.0 and now - getattr(self, "cam_fallback", 0) > 0.5:
                     # hold the camera through short dropouts, recenter on long ones
                     self.target = (self.target[0] * 0.5, self.target[1] * 0.5)
                     if self.status == "Tracking":
