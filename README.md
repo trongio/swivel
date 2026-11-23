@@ -29,7 +29,8 @@ both.
   Euro filter (steady when you're still, quick when you turn) and glides the stick
   at 120 Hz
 - **Webcam** (optional, needs [uv](https://docs.astral.sh/uv/)): *Drift correction*
-  uses MediaPipe face tracking as a drift-free reference and slowly pulls the
+  uses OpenTrack's neural-net head-pose model (tracks to ~65 degrees; MediaPipe is
+  available with --backend mediapipe) as a drift-free reference and slowly pulls the
   headphones' center back while your head is still; *Control* steers the camera with
   your face alone, no headphones needed. Video stays in the local helper process;
   only head angles reach Swivel
