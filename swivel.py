@@ -45,11 +45,11 @@ DEFAULTS = {"yaw_max": 35.0, "pitch_max": 20.0, "deadzone": 0.5, "curve": 1.0,
             "anti_deadzone": 0.2, "smooth": 0.35, "invert_yaw": False,
             "invert_pitch": False, "pad": "xbox", "tracker": ""}
 HISTORY_SECONDS = 10.0
-# Headsets send ~25 reports/s (gaps <= ~65 ms). If they go quiet for this long, restart
-# the tracker (it re-enables the sensor and streams again ~175 ms later). Backs off when
-# the headset really is gone, so it doesn't respawn in a tight loop.
-STALL_SECONDS = 0.3
-STALL_MAX_SECONDS = 3.0
+# Headsets send ~25 reports/s. If they go quiet this long, restart the tracker (it
+# re-enables the sensor). Restarts talk to the headset over Bluetooth, so keep them
+# rare: back off up to STALL_MAX_SECONDS, or a busy link can drop entirely.
+STALL_SECONDS = 2.0
+STALL_MAX_SECONDS = 30.0
 DEMO = bool(os.environ.get("SWIVEL_DEMO"))
 if DEMO:
     APP_ID += ".Demo"  # run alongside a real instance
@@ -274,8 +274,6 @@ class Engine:
                 self.fail_streak += 1
                 self.status = f"Headphones went quiet, restarting tracker ({self.restarts})…"
                 self._kill_proc()
-                if not sony_hidraw_present():
-                    connect_hid_profiles()
                 self._spawn(tracker)
                 # a new tracker calls wherever the head points "zero"; continue from
                 # the last known angles instead of jumping
