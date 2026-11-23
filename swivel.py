@@ -104,14 +104,20 @@ class VirtualPad:
     def _ev(self, typ, code, val):
         os.write(self.fd, struct.pack("<qqHHi", 0, 0, typ, code, val))
 
-    def _axis(self, v):
+    def _axis(self, v, last):
         v = max(-1.0, min(1.0, v))
-        return int(round((v + 1) / 2 * (self.hi - self.lo) + self.lo))
+        f = (v + 1) / 2 * (self.hi - self.lo) + self.lo
+        # Hysteresis of 0.8 step: a value hovering between two stick positions
+        # (very visible on the 8-bit PlayStation stick) doesn't toggle between them.
+        if last is not None and abs(f - last) < 0.8 and not (v == 0 and last != round(f)):
+            return last
+        return int(round(f))
 
     def right_stick(self, x, y):
         # Only send changes, so the game doesn't keep treating this pad as the
         # active controller (and switching button prompts) while your head is still.
-        val = (self._axis(x), self._axis(-y))  # head up = stick up
+        lx, ly = self.last if self.last else (None, None)
+        val = (self._axis(x, lx), self._axis(-y, ly))  # head up = stick up
         if val == self.last:
             return
         self.last = val
@@ -251,6 +257,8 @@ def find_uv():
     return None
 
 
+HYST = 0.6  # degrees past the deadzone before the stick engages
+RAMP = 0.8  # degrees over which the game-deadzone compensation fades in
 OUTPUT_HZ = 120  # stick updates per second (the headset only reports ~25/s)
 GLIDE_SECONDS = 0.03  # how fast the stick glides to each new filtered target
 
@@ -281,6 +289,7 @@ class Engine:
         self.target = (0.0, 0.0)
         self.filters = (OneEuro(), OneEuro())
         self.out_thread = None
+        self.engaged = [False, False]
         self.cam_proc = self.cam_sock = self.cam_thread = self.cam_log = None
         self.cam = None  # (time, yaw, pitch) relative to the webcam center, signs applied
         self.cam_raw = None  # (yaw, pitch) as the helper reports them
@@ -288,13 +297,25 @@ class Engine:
         self.cam_want_recenter = True
         self.cam_status = ""
 
-    def shape(self, deg, max_deg):
+    def shape(self, deg, max_deg, axis=0):
+        """Head degrees -> stick deflection.
+
+        The deadzone has hysteresis (engage at deadzone + HYST, release at deadzone)
+        and the game-deadzone compensation ramps in over RAMP degrees, so sensor
+        noise near the edge can't flick the stick on and off.
+        """
         dz = self.cfg["deadzone"]
-        mag = abs(deg) - dz
-        if mag <= 0:
+        engaged = self.engaged[axis]
+        if not engaged and abs(deg) >= dz + HYST:
+            engaged = True
+        elif engaged and abs(deg) <= dz:
+            engaged = False
+        self.engaged[axis] = engaged
+        if not engaged:
             return 0.0
+        mag = abs(deg) - dz
         x = min(mag / max(max_deg - dz, 1e-3), 1.0) ** self.cfg["curve"]
-        ad = self.cfg["anti_deadzone"]  # jump past the game's own stick deadzone
+        ad = self.cfg["anti_deadzone"] * min(1.0, mag / RAMP)  # jump past the game's own stick deadzone
         return math.copysign(ad + (1 - ad) * x, deg)
 
     def axes(self):
@@ -474,8 +495,8 @@ class Engine:
 
     def _set_target(self, dt):
         c = self.cfg
-        tx = self.shape(self.yaw, c["yaw_max"]) * (-1 if c["invert_yaw"] else 1)
-        ty = self.shape(self.pitch, c["pitch_max"]) * (-1 if c["invert_pitch"] else 1)
+        tx = self.shape(self.yaw, c["yaw_max"], 0) * (-1 if c["invert_yaw"] else 1)
+        ty = self.shape(self.pitch, c["pitch_max"], 1) * (-1 if c["invert_pitch"] else 1)
         mag = math.hypot(tx, ty)
         if mag > 1:  # round gate, like a real stick
             tx, ty = tx / mag, ty / mag
