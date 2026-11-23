@@ -28,6 +28,11 @@ both.
 - Smooth camera: the headset reports ~25 times a second; Swivel filters with a One
   Euro filter (steady when you're still, quick when you turn) and glides the stick
   at 120 Hz
+- **Webcam** (optional, needs [uv](https://docs.astral.sh/uv/)): *Drift correction*
+  uses MediaPipe face tracking as a drift-free reference and slowly pulls the
+  headphones' center back while your head is still; *Control* steers the camera with
+  your face alone, no headphones needed. Video stays in the local helper process;
+  only head angles reach Swivel
 - Connects the headset's head-tracking channel automatically (most Sony headsets
   connect for audio only)
 - Recenter button and keyboard shortcut, plus automatic drift correction: the

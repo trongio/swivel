@@ -44,7 +44,8 @@ HID_UUID = "00001124-0000-1000-8000-00805f9b34fb"
 DEFAULTS = {"yaw_max": 35.0, "pitch_max": 20.0, "deadzone": 0.5, "curve": 1.0,
             "anti_deadzone": 0.2, "smooth": 0.35, "invert_yaw": False,
             "invert_pitch": False, "pad": "playstation", "tracker": "", "drift": 0.5,
-            "yaw_axis": None, "pitch_axis": None, "bias": None}
+            "yaw_axis": None, "pitch_axis": None, "bias": None,
+            "webcam": "off", "cam_device": "/dev/video0", "cam_sign": [1, 1]}
 HISTORY_SECONDS = 10.0
 # Headsets send ~25 reports/s. If they go quiet this long, restart the tracker (it
 # re-enables the sensor). Restarts talk to the headset over Bluetooth, so keep them
@@ -236,6 +237,20 @@ class OneEuro:
         return self.x
 
 
+CAM_PORT = 4243
+CAM_STALE = 0.4  # seconds; older webcam poses are ignored
+CAM_TAU = 1.5  # seconds; how fast the webcam pulls the headphone center back
+CAM_MAX_SPEED_DPS = 40.0  # only correct while the head moves slower than this
+CAM_MAX_ANGLE = 35.0  # face tracking is unreliable beyond this
+
+
+def find_uv():
+    for cand in (shutil.which("uv"), Path.home() / ".local/bin/uv", Path.home() / ".cargo/bin/uv"):
+        if cand and os.access(str(cand), os.X_OK):
+            return str(cand)
+    return None
+
+
 OUTPUT_HZ = 120  # stick updates per second (the headset only reports ~25/s)
 GLIDE_SECONDS = 0.03  # how fast the stick glides to each new filtered target
 
@@ -266,6 +281,12 @@ class Engine:
         self.target = (0.0, 0.0)
         self.filters = (OneEuro(), OneEuro())
         self.out_thread = None
+        self.cam_proc = self.cam_sock = self.cam_thread = self.cam_log = None
+        self.cam = None  # (time, yaw, pitch) relative to the webcam center, signs applied
+        self.cam_raw = None  # (yaw, pitch) as the helper reports them
+        self.cam_center = None
+        self.cam_want_recenter = True
+        self.cam_status = ""
 
     def shape(self, deg, max_deg):
         dz = self.cfg["deadzone"]
@@ -315,23 +336,36 @@ class Engine:
             self.qc = q_mul(self.qc, q_axis_angle(self.axes()[0], shift))
             self.yaw -= shift
 
+    def mode(self):
+        return self.cfg.get("webcam", "off")
+
     def start(self):
-        tracker = find_tracker(self.cfg.get("tracker"))
-        if not tracker:
+        control = self.mode() == "control"
+        tracker = None if control else find_tracker(self.cfg.get("tracker"))
+        if not control and not tracker:
             raise FileNotFoundError("sony-tracker not found (install it or set its path)")
         self.pad = VirtualPad(self.cfg.get("pad", "playstation"))
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind(("127.0.0.1", PORT))
-        self.sock.settimeout(0.05)
+        if not control:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.bind(("127.0.0.1", PORT))
+            self.sock.settimeout(0.05)
         self.running = True
+        self.cam = self.cam_raw = None
+        self.cam_want_recenter = True
+        if self.mode() != "off":
+            self._start_cam()
         self.want_recenter = True
         self.restarts = 0
         self.last_packet = self.spawned = time.monotonic()
         self.status = "Connecting to headphones…"
         self.target = (0.0, 0.0)
         self.filters = (OneEuro(), OneEuro())
-        self.thread = threading.Thread(target=self._loop, args=(tracker,), daemon=True)
-        self.thread.start()
+        if control:
+            self.status = "Starting webcam…"
+            self.thread = None
+        else:
+            self.thread = threading.Thread(target=self._loop, args=(tracker,), daemon=True)
+            self.thread.start()
         self.out_thread = threading.Thread(target=self._output_loop, daemon=True)
         self.out_thread.start()
 
@@ -360,11 +394,114 @@ class Engine:
                 self.proc.wait()
         self.proc = None
 
+    def _start_cam(self):
+        uv = find_uv()
+        helper = HERE / "swivel_cam.py"
+        if not uv or not helper.exists():
+            self.cam_status = "webcam helper unavailable (needs uv)"
+            return
+        self.cam_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.cam_sock.bind(("127.0.0.1", CAM_PORT))
+        self.cam_sock.settimeout(0.1)
+        self.cam_log = open(Path(GLib.get_user_runtime_dir()) / "swivel-webcam.log", "w")
+        self.cam_proc = subprocess.Popen(
+            [uv, "run", "--quiet", "--script", str(helper), "--device", self.cfg.get("cam_device", "/dev/video0"),
+             "--port", str(CAM_PORT)], stdout=subprocess.DEVNULL, stderr=self.cam_log)
+        self.cam_status = "webcam starting"
+        self.cam_thread = threading.Thread(target=self._cam_loop, daemon=True)
+        self.cam_thread.start()
+
+    def _cam_loop(self):
+        last = None
+        while self.running:
+            try:
+                data = self.cam_sock.recv(64)
+            except (socket.timeout, OSError):
+                data = None
+            if self.cam_proc and self.cam_proc.poll() is not None:
+                self.cam_status = "webcam helper stopped (see swivel-webcam.log)"
+                break
+            if not data or len(data) < 56:
+                continue
+            *_xyz, yaw, pitch, _roll, valid = struct.unpack("<7d", data[:56])
+            now = time.monotonic()
+            with self.lock:
+                if valid < 0.5:
+                    self.cam = None
+                    self.cam_status = "webcam: no face"
+                    continue
+                self.cam_raw = (yaw, pitch)
+                if self.cam_want_recenter or self.cam_center is None:
+                    self.cam_center = (yaw, pitch)
+                    self.cam_want_recenter = False
+                sy, sp = self.cfg.get("cam_sign", [1, 1])
+                cy = sy * (yaw - self.cam_center[0])
+                cp = sp * (pitch - self.cam_center[1])
+                self.cam = (now, cy, cp)
+                self.cam_status = "webcam: tracking"
+                if self.mode() == "control":
+                    if self.want_recenter:
+                        self.cam_center = (yaw, pitch)
+                        self.want_recenter = False
+                        cy = cp = 0.0
+                    if self.calib_sink is not None:
+                        self.calib_sink.append((now, (cy, cp)))
+                    self.yaw, self.pitch, self.roll = cy, cp, 0.0
+                    dt = now - last if last and 0 < now - last < 0.5 else 1 / 30
+                    last = now
+                    self._set_target(dt)
+                    self.last_packet = now
+                    self.status = "Tracking (webcam)"
+                    if not self.history or now - self.history[-1][0] >= 0.02:
+                        self.history.append((now, self.yaw, self.pitch, self.roll))
+
+    def _webcam_assist(self, dt, speed):
+        """Pull the headphone center toward the webcam's drift-free view of the head."""
+        if self.mode() != "assist" or self.calibrating or not self.cam or not 0 < dt < 0.5:
+            return False
+        t, cy, cp = self.cam
+        if time.monotonic() - t > CAM_STALE or speed > CAM_MAX_SPEED_DPS:
+            return False
+        if abs(cy) > CAM_MAX_ANGLE or abs(cp) > CAM_MAX_ANGLE:
+            return False
+        k = min(1.0, dt / CAM_TAU)
+        ya, pa = self.axes()
+        ey, ep = (self.yaw - cy) * k, (self.pitch - cp) * k
+        self.qc = q_mul(q_mul(self.qc, q_axis_angle(ya, ey)), q_axis_angle(pa, ep))
+        self.yaw -= ey
+        self.pitch -= ep
+        return True
+
+    def _set_target(self, dt):
+        c = self.cfg
+        tx = self.shape(self.yaw, c["yaw_max"]) * (-1 if c["invert_yaw"] else 1)
+        ty = self.shape(self.pitch, c["pitch_max"]) * (-1 if c["invert_pitch"] else 1)
+        mag = math.hypot(tx, ty)
+        if mag > 1:  # round gate, like a real stick
+            tx, ty = tx / mag, ty / mag
+        # Smoothing slider -> One Euro minimum cutoff (0 = snappy, 0.9 = very smooth)
+        mc = 0.4 + 4.0 * (1 - c["smooth"])
+        fx, fy = self.filters
+        fx.min_cutoff = fy.min_cutoff = mc
+        self.target = (fx(tx, dt), fy(ty, dt))
+
     def stop(self, keep_status=False):
         self.running = False
-        for t in (self.thread, self.out_thread):
+        for t in (self.thread, self.out_thread, self.cam_thread):
             if t and t is not threading.current_thread():
                 t.join(2)
+        if self.cam_proc and self.cam_proc.poll() is None:
+            self.cam_proc.terminate()
+            try:
+                self.cam_proc.wait(3)
+            except subprocess.TimeoutExpired:
+                self.cam_proc.kill()
+        self.cam_proc = None
+        for f in ("cam_sock", "cam_log"):
+            if getattr(self, f):
+                getattr(self, f).close()
+                setattr(self, f, None)
+        self.cam = None
         self._kill_proc()
         if self.errlog:
             self.errlog.close()
@@ -435,7 +572,6 @@ class Engine:
                 # a new tracker calls wherever the head points "zero"; continue from
                 # the last known angles instead of jumping
                 self.reanchor = True
-            c = self.cfg
             with self.lock:
                 now = time.monotonic()
                 if data and len(data) >= 48:
@@ -447,6 +583,7 @@ class Engine:
                         self.qc = q
                         self.want_recenter = False
                         self.reanchor = False
+                        self.cam_want_recenter = True
                     elif self.reanchor:
                         # new tracker, new zero: keep the last relative orientation
                         self.qc = q_mul(q, q_conj(self.qr))
@@ -454,19 +591,13 @@ class Engine:
                     self.qr = q_mul(q_conj(self.qc), q)
                     if self.calib_sink is not None:
                         self.calib_sink.append((now, self.qr))
+                    prev_yaw = self.yaw
                     self.yaw, self.pitch, self.roll = self.decompose(q_rotvec(self.qr))
-                    self._correct_drift(now)
-                    tx = self.shape(self.yaw, c["yaw_max"]) * (-1 if c["invert_yaw"] else 1)
-                    ty = self.shape(self.pitch, c["pitch_max"]) * (-1 if c["invert_pitch"] else 1)
-                    mag = math.hypot(tx, ty)
-                    if mag > 1:  # round gate, like a real stick
-                        tx, ty = tx / mag, ty / mag
-                    # Smoothing slider -> One Euro minimum cutoff (0 = snappy, 0.9 = very smooth)
-                    mc = 0.4 + 4.0 * (1 - c["smooth"])
-                    fx, fy = self.filters
-                    fx.min_cutoff = fy.min_cutoff = mc
                     dt = pkt_dt if 0 < pkt_dt < 0.5 else 0.04
-                    self.target = (fx(tx, dt), fy(ty, dt))
+                    speed = abs(self.yaw - prev_yaw) / dt
+                    if not self._webcam_assist(dt, speed):
+                        self._correct_drift(now)
+                    self._set_target(dt)
                     self.last_packet = now
                     self.fail_streak = 0
                     self.status = "Tracking"
@@ -676,6 +807,21 @@ class Window(Adw.ApplicationWindow):
 
         GLib.idle_add(hook_pad_row)
         ctl.add(pad_row)
+        modes = ["off", "assist", "control"]
+        cam_row = Adw.ComboRow(title="Webcam",
+                               subtitle="Drift correction keeps the headphones' center true. "
+                                        "Control steers with your face, no headphones. Applies on next start",
+                               model=Gtk.StringList.new(["Off", "Drift correction", "Control (no headphones)"]))
+        cam_want = modes.index(self.cfg.get("webcam", "off")) if self.cfg.get("webcam") in modes else 0
+        cam_row.set_selected(cam_want)
+
+        def hook_cam_row():
+            cam_row.set_selected(cam_want)
+            cam_row.connect("notify::selected", lambda r, _p: self.set_cfg("webcam", modes[r.get_selected()]))
+            return False
+
+        GLib.idle_add(hook_cam_row)
+        ctl.add(cam_row)
         self.inv_rows = {k: self._switch(ctl, t, k) for t, k in
                          (("Invert yaw", "invert_yaw"), ("Invert pitch", "invert_pitch"))}
         self.axes_row = Adw.ActionRow(title="Head axes")
@@ -739,7 +885,7 @@ class Window(Adw.ApplicationWindow):
 
     def start_calibration(self):
         e = self.engine
-        if not e.running or e.status != "Tracking":
+        if not e.running or not e.status.startswith("Tracking"):
             self._flash("Start tracking first, then press Calibrate")
             return
         if self.calib_steps:
@@ -756,18 +902,31 @@ class Window(Adw.ApplicationWindow):
             (2.0, "Look straight at the screen again", None, self._calib_finish),
         ]
         e.calibrating = True
+        self.cam_samples = None
+        GLib.timeout_add(33, self._cam_sample)
         self._calib_next()
 
     def _calib_center_collect(self):
         self.engine.want_recenter = True
         self.engine.calib_sink = []
+        self.cam_samples = []
 
     def _calib_collect(self):
         self.engine.calib_sink = []
+        self.cam_samples = []
 
     def _calib_take(self, name):
         self.results[name] = self.engine.calib_sink or []
         self.engine.calib_sink = None
+        self.results["cam_" + name] = list(self.cam_samples or [])
+        self.cam_samples = None
+
+    def _cam_sample(self):
+        # record raw webcam angles during calibration holds
+        e = self.engine
+        if self.cam_samples is not None and e.cam_raw is not None and e.cam:
+            self.cam_samples.append(e.cam_raw)
+        return self.calib_steps is not None
 
     def _calib_next(self):
         if not self.calib_steps:
@@ -804,6 +963,11 @@ class Window(Adw.ApplicationWindow):
     def _calib_finish(self):
         self.calib_steps = None
         self.engine.calibrating = False
+        cam_msg = self._calib_cam_signs()
+        if self.engine.mode() == "control":
+            self.engine.want_recenter = True
+            self._flash(cam_msg or "Calibration failed: the webcam didn't see your face")
+            return
 
         def mean_rotvec(samples):
             vs = [q_rotvec(q) for _t, q in samples]
@@ -826,7 +990,21 @@ class Window(Adw.ApplicationWindow):
             row.set_active(False)  # calibration already defines up = up, right = right
         self.engine.want_recenter = True
         self._update_axes_row()
-        self._flash("Calibrated. Up/down and left/right now follow your head")
+        self._flash("Calibrated. Up/down and left/right now follow your head" + (f". {cam_msg}" if cam_msg else ""))
+
+    def _calib_cam_signs(self):
+        """Learn which way the webcam's yaw/pitch grow when you look right/up."""
+        still, up, right = (self.results.get(k) for k in ("cam_still", "cam_up", "cam_right"))
+        if not still or not up or not right:
+            return ""
+        base = (sum(v[0] for v in still) / len(still), sum(v[1] for v in still) / len(still))
+        dy = sum(v[0] for v in right) / len(right) - base[0]
+        dp = sum(v[1] for v in up) / len(up) - base[1]
+        if abs(dy) < 5 or abs(dp) < 5:
+            return "Webcam not calibrated: turn further"
+        self.set_cfg("cam_sign", [1 if dy > 0 else -1, 1 if dp > 0 else -1])
+        self.engine.cam_want_recenter = True
+        return "Webcam calibrated"
 
     @staticmethod
     def _measure_bias(samples):
@@ -885,7 +1063,8 @@ class Window(Adw.ApplicationWindow):
             e.stop(keep_status=True)
             self.toggle.set_active(False)
         self.status.set_label(self.calib_msg or e.status)
-        self.readout.set_label(f"yaw {e.yaw:+6.1f}°    pitch {e.pitch:+6.1f}°    roll {e.roll:+6.1f}°")
+        cam = f"    ·    {e.cam_status}" if e.running and e.mode() != "off" and e.cam_status else ""
+        self.readout.set_label(f"yaw {e.yaw:+6.1f}°    pitch {e.pitch:+6.1f}°    roll {e.roll:+6.1f}°{cam}")
         for w in (self.stick, self.model, self.graph):
             w.queue_draw()
         return True
