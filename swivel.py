@@ -1447,6 +1447,10 @@ class Window(Adw.ApplicationWindow):
             self._flash("Calibration failed: turn your head further (at least ~15°) and hold it")
             return None
         pa, ya = v_norm(up), v_norm(right)
+        # The headset's y axis runs ear to ear, which is the pitch axis whatever the fit. Looking
+        # up with a slight head tilt otherwise skews it, and then tilting reads as looking up.
+        ear = (0.0, 1.0 if pa[1] >= 0 else -1.0, 0.0)
+        pa = v_norm(tuple(e - v_dot(ear, ya) * y for e, y in zip(ear, ya)))
         if abs(v_dot(pa, ya)) > 0.9:
             cue("dialog-warning", "Calibration failed. Try again.", clip="calib-failed")
             self._flash("Calibration failed: up and right looked the same, try again")
