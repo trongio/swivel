@@ -602,8 +602,17 @@ class Window(Adw.ApplicationWindow):
         pad_row = Adw.ComboRow(title="Controller type",
                                subtitle="Keep Xbox if you use a real DualSense in the game. Applies on next start",
                                model=Gtk.StringList.new(["PlayStation", "Xbox"]))
-        pad_row.set_selected(kinds.index(self.cfg.get("pad", "xbox")))
-        pad_row.connect("notify::selected", lambda r, _p: self.set_cfg("pad", kinds[r.get_selected()]))
+        want = kinds.index(self.cfg.get("pad", "xbox"))
+        pad_row.set_selected(want)
+
+        def hook_pad_row():
+            # GTK can reset the selection to 0 while the row is set up; reapply the
+            # saved value first, and only then start saving user changes.
+            pad_row.set_selected(want)
+            pad_row.connect("notify::selected", lambda r, _p: self.set_cfg("pad", kinds[r.get_selected()]))
+            return False
+
+        GLib.idle_add(hook_pad_row)
         ctl.add(pad_row)
         self.inv_rows = {k: self._switch(ctl, t, k) for t, k in
                          (("Invert yaw", "invert_yaw"), ("Invert pitch", "invert_pitch"))}
