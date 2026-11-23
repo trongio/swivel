@@ -153,17 +153,6 @@ class OpenTrackNN:
         return nose_angles(q)
 
 
-def nose_angles(q):
-    """(yaw, pitch, roll) in degrees from where the nose points. Unlike rotation-vector parts,
-    yaw and pitch stay put when the head tilts sideways."""
-    w, x, y, z = q
-    fx, fy, fz = -2 * (x * z + w * y), -2 * (y * z - w * x), -(1 - 2 * (x * x + y * y))
-    yaw = math.degrees(math.atan2(-fx, -fz))
-    pitch = math.degrees(math.atan2(fy, math.hypot(fx, fz)))
-    # roll: the head's own sideways tilt, only shown, never used
-    roll = math.degrees(math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)))
-    return yaw, pitch, roll
-
     @staticmethod
     def rotvec(q):
         w_, x_, y_, z_ = float(q[3]), float(q[0]), float(q[1]), float(q[2])
@@ -174,6 +163,18 @@ def nose_angles(q):
             return 0.0, 0.0, 0.0
         ang = math.degrees(2 * math.atan2(n, w_))
         return x_ / n * ang, y_ / n * ang, z_ / n * ang
+
+
+def nose_angles(q):
+    """(yaw, pitch, roll) in degrees from where the nose points. Unlike rotation-vector parts,
+    yaw and pitch stay put when the head tilts sideways."""
+    w, x, y, z = q
+    fx, fy, fz = -2 * (x * z + w * y), -2 * (y * z - w * x), -(1 - 2 * (x * x + y * y))
+    yaw = math.degrees(math.atan2(-fx, -fz))
+    pitch = math.degrees(math.atan2(fy, math.hypot(fx, fz)))
+    # roll: the head's own sideways tilt, only shown, never used
+    roll = math.degrees(math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)))
+    return yaw, pitch, roll
 
 
 class OneEuro:
