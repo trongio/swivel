@@ -40,6 +40,27 @@ sed -e "s|@EXEC@|$PY $DEST/swivel.py|" -e "s|@ICON@|$DEST/swivel.svg|" \
   "$SRC/data/io.github.trongio.Swivel.desktop.in" >"$APPS/io.github.trongio.Swivel.desktop"
 update-desktop-database "$APPS" 2>/dev/null || true
 
+# `swivel` command (also used by the recenter shortcut)
+BIN="$HOME/.local/bin"
+mkdir -p "$BIN"
+printf '#!/bin/sh\nexec %s %s "$@"\n' "$PY" "$DEST/swivel.py" >"$BIN/swivel"
+chmod +x "$BIN/swivel"
+
+# Optional: ./install.sh --gnome-shortcut F8  binds a GNOME shortcut to recenter
+if [[ ${1:-} == --gnome-shortcut && -n ${2:-} ]]; then
+  base=org.gnome.settings-daemon.plugins.media-keys
+  path=/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/swivel-recenter/
+  list=$(gsettings get $base custom-keybindings)
+  if [[ $list != *"$path"* ]]; then
+    if [[ $list == "@as []" || $list == "[]" ]]; then list="['$path']"; else list="${list%]}, '$path']"; fi
+    gsettings set $base custom-keybindings "$list"
+  fi
+  gsettings set "$base.custom-keybinding:$path" name "Swivel: recenter"
+  gsettings set "$base.custom-keybinding:$path" command "$BIN/swivel --recenter"
+  gsettings set "$base.custom-keybinding:$path" binding "$2"
+  echo "Recenter shortcut: $2"
+fi
+
 echo "Installed to $DEST"
 if [[ ! -f /etc/udev/rules.d/71-swivel.rules ]]; then
   cat <<EOF

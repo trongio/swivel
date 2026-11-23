@@ -8,7 +8,7 @@ virtual controller created through /dev/uinput, so any game that lets you look
 around with the right stick gets head tracking, including Proton games with no
 TrackIR/OpenTrack support.
 
-Recenter from a keyboard shortcut: kill -USR1 "$(cat "$XDG_RUNTIME_DIR/swivel.pid")"
+Recenter from a keyboard shortcut: python3 swivel.py --recenter
 """
 import collections
 import fcntl
@@ -497,8 +497,8 @@ class Window(Adw.ApplicationWindow):
         self._switch(ctl, "Invert yaw", "invert_yaw")
         self._switch(ctl, "Invert pitch", "invert_pitch")
         hint = Adw.PreferencesGroup(
-            description="Start this before the game. Recenter from a keyboard shortcut: "
-                        'kill -USR1 "$(cat "$XDG_RUNTIME_DIR/swivel.pid")"')
+            description="Start this before the game. Recenter from a keyboard shortcut "
+                        "bound to: swivel --recenter")
 
         page = Adw.PreferencesPage()
         top = Adw.PreferencesGroup()
@@ -723,5 +723,18 @@ class App(Adw.Application):
         Adw.Application.do_shutdown(self)
 
 
+def recenter_running():
+    """`swivel.py --recenter`: tell the running Swivel to recenter (bind this to a key)."""
+    import sys
+    try:
+        os.kill(int(PIDFILE.read_text()), signal.SIGUSR1)
+    except (OSError, ValueError):
+        sys.exit("Swivel isn't running")
+
+
 if __name__ == "__main__":
-    App().run(None)
+    import sys
+    if "--recenter" in sys.argv[1:]:
+        recenter_running()
+    else:
+        App().run(None)

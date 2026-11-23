@@ -65,10 +65,11 @@ the virtual controller without root.
 2. Open Swivel and flip the switch in the header bar.
 3. Start the game, face the screen, and press **Recenter**.
 
-To recenter from a keyboard shortcut, bind this command:
+To recenter from a keyboard shortcut (works while the game is fullscreen), bind
+`swivel --recenter` to a key. On GNOME the installer can do it for you:
 
 ```bash
-kill -USR1 "$(cat "$XDG_RUNTIME_DIR/swivel.pid")"
+./install.sh --gnome-shortcut F8
 ```
 
 If the camera turns the wrong way, use **Invert yaw** / **Invert pitch**. If it
