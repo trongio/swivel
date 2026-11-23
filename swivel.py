@@ -245,6 +245,7 @@ class OneEuro:
 
 
 CAM_PORT = 4243
+PHONE_PORT = 4244  # Swivel Cam (Android) connects here through `adb reverse`
 CAM_STALE = 0.4  # seconds; older webcam poses are ignored
 CAM_TAU = 1.5  # seconds; how fast the webcam pulls the headphone center back
 CAM_MAX_SPEED_DPS = 40.0  # only correct while the head moves slower than this
@@ -435,6 +436,8 @@ class Engine:
         self.proc = None
 
     def _start_cam(self):
+        if self.cfg.get("cam_device") == "phone":
+            return self._start_phone()
         uv = find_uv()
         helper = HERE / "swivel_cam.py"
         if not uv or not helper.exists():
@@ -450,6 +453,57 @@ class Engine:
         self.cam_status = "webcam starting"
         self.cam_thread = threading.Thread(target=self._cam_loop, daemon=True)
         self.cam_thread.start()
+
+    def _start_phone(self):
+        """Use the Swivel Cam Android app over USB: adb reverse + a TCP relay into the cam pipeline."""
+        adb = shutil.which("adb") or str(Path.home() / "Android/Sdk/platform-tools/adb")
+        try:
+            subprocess.run([adb, "reverse", f"tcp:{PHONE_PORT}", f"tcp:{PHONE_PORT}"], capture_output=True, timeout=10)
+            subprocess.run([adb, "shell", "am", "start", "-n",
+                            "io.github.trongio.swivel.cam/io.github.trongio.swivel.MainActivity"],
+                           capture_output=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            self.cam_status = "phone: adb not available"
+            return
+        self.cam_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.cam_sock.bind(("127.0.0.1", CAM_PORT))
+        self.cam_sock.settimeout(0.1)
+        self.cam_status = "phone: waiting for Swivel Cam app"
+        threading.Thread(target=self._phone_relay, daemon=True).start()
+        self.cam_thread = threading.Thread(target=self._cam_loop, daemon=True)
+        self.cam_thread.start()
+
+    def _phone_relay(self):
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", PHONE_PORT))
+        srv.listen(1)
+        srv.settimeout(0.5)
+        out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            while self.running:
+                try:
+                    conn, _ = srv.accept()
+                except socket.timeout:
+                    continue
+                conn.settimeout(1.0)
+                buf = b""
+                with conn:
+                    while self.running:
+                        try:
+                            data = conn.recv(4096)
+                        except socket.timeout:
+                            continue
+                        if not data:
+                            break
+                        buf += data
+                        while len(buf) >= 56:
+                            out.sendto(buf[:56], ("127.0.0.1", CAM_PORT))
+                            buf = buf[56:]
+                self.cam_status = "phone: disconnected"
+        finally:
+            srv.close()
+            out.close()
 
     def _cam_loop(self):
         last = None
@@ -917,6 +971,19 @@ class Window(Adw.ApplicationWindow):
 
         GLib.idle_add(hook_cam_row)
         ctl.add(cam_row)
+        srcs = ["/dev/video0", "phone"]
+        src_row = Adw.ComboRow(title="Camera source", subtitle="PC webcam, or the Swivel Cam app on a phone over USB",
+                               model=Gtk.StringList.new(["PC webcam", "Phone (Swivel Cam app)"]))
+        src_want = srcs.index(self.cfg.get("cam_device")) if self.cfg.get("cam_device") in srcs else 0
+        src_row.set_selected(src_want)
+
+        def hook_src_row():
+            src_row.set_selected(src_want)
+            src_row.connect("notify::selected", lambda r, _p: self.set_cfg("cam_device", srcs[r.get_selected()]))
+            return False
+
+        GLib.idle_add(hook_src_row)
+        ctl.add(src_row)
         self._switch(ctl, "Ignore head tilt (roll)", "ignore_roll")
         self.inv_rows = {k: self._switch(ctl, t, k) for t, k in
                          (("Invert yaw", "invert_yaw"), ("Invert pitch", "invert_pitch"))}

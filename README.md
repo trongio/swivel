@@ -35,6 +35,9 @@ both.
   headphones' center back while your head is still; *Control* steers the camera with
   your face alone, no headphones needed. Video stays in the local helper process;
   only head angles reach Swivel
+- **Phone as the camera**: the Swivel Cam Android app (`android/`) runs face tracking
+  on the phone's GPU at 30 fps and streams head angles over USB (`adb reverse`); pick
+  *Camera source: Phone* in Swivel. Build with `cd android && ./gradlew assembleDebug`
 - Connects the headset's head-tracking channel automatically (most Sony headsets
   connect for audio only)
 - Recenter button and keyboard shortcut, plus automatic drift correction: the
