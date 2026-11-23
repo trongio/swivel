@@ -41,7 +41,7 @@ HERE = Path(__file__).resolve().parent
 CONF = Path(GLib.get_user_config_dir()) / "swivel/settings.json"
 PIDFILE = Path(GLib.get_user_runtime_dir()) / "swivel.pid"
 HID_UUID = "00001124-0000-1000-8000-00805f9b34fb"
-DEFAULTS = {"yaw_max": 35.0, "pitch_max": 20.0, "deadzone": 0.5, "curve": 1.0,
+DEFAULTS = {"yaw_max": 35.0, "pitch_max": 20.0, "deadzone": 2.5, "curve": 1.0,
             "anti_deadzone": 0.2, "smooth": 0.35, "invert_yaw": False,
             "invert_pitch": False, "pad": "playstation", "tracker": "", "drift": 0.5,
             "yaw_axis": None, "pitch_axis": None, "bias": None,
@@ -291,6 +291,10 @@ class Engine:
         self.filters = (OneEuro(), OneEuro())
         self.out_thread = None
         self.engaged = [False, False]
+        self.trace = None  # diagnostics: $XDG_RUNTIME_DIR/swivel-trace.csv, 5 Hz
+        self.trace_t = 0.0
+        self.assist_on = False
+        self.recenters = 0
         self.cam_proc = self.cam_sock = self.cam_thread = self.cam_log = None
         self.cam = None  # (time, yaw, pitch) relative to the webcam center, signs applied
         self.cam_raw = None  # (yaw, pitch) as the helper reports them
@@ -491,6 +495,23 @@ class Engine:
                     if not self.history or now - self.history[-1][0] >= 0.02:
                         self.history.append((now, self.yaw, self.pitch, self.roll))
 
+    def _trace(self, now, speed):
+        if now - self.trace_t < 0.2:
+            return
+        self.trace_t = now
+        try:
+            if self.trace is None:
+                self.trace = open(Path(GLib.get_user_runtime_dir()) / "swivel-trace.csv", "w", buffering=1)
+                self.trace.write("t,yaw,pitch,cam_yaw,cam_pitch,cam_age,assist,speed,stick_x,stick_y,restarts,recenters\n")
+            cam = self.cam
+            cy, cp, age = (cam[1], cam[2], now - cam[0]) if cam else ("", "", "")
+            self.trace.write(f"{now:.2f},{self.yaw:.2f},{self.pitch:.2f},{cy if cy == '' else f'{cy:.2f}'},"
+                             f"{cp if cp == '' else f'{cp:.2f}'},{age if age == '' else f'{age:.2f}'},"
+                             f"{int(self.assist_on)},{speed:.0f},{self.sx:.3f},{self.sy:.3f},"
+                             f"{self.restarts},{self.recenters}\n")
+        except OSError:
+            pass
+
     def _webcam_assist(self, dt, speed):
         """Pull the headphone center toward the webcam's drift-free view of the head."""
         if self.mode() != "assist" or self.calibrating or not self.cam or not 0 < dt < 0.5:
@@ -620,6 +641,7 @@ class Engine:
                         self.want_recenter = False
                         self.reanchor = False
                         self.cam_want_recenter = True
+                        self.recenters += 1
                     elif self.reanchor:
                         # new tracker, new zero: keep the last relative orientation
                         self.qc = q_mul(q, q_conj(self.qr))
@@ -631,9 +653,11 @@ class Engine:
                     self.yaw, self.pitch, self.roll = self.decompose(q_rotvec(self.without_roll(self.qr)))
                     dt = pkt_dt if 0 < pkt_dt < 0.5 else 0.04
                     speed = abs(self.yaw - prev_yaw) / dt
-                    if not self._webcam_assist(dt, speed):
+                    self.assist_on = self._webcam_assist(dt, speed)
+                    if not self.assist_on:
                         self._correct_drift(now)
                     self._set_target(dt)
+                    self._trace(now, speed)
                     self.last_packet = now
                     self.fail_streak = 0
                     self.status = "Tracking"
