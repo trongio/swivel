@@ -176,6 +176,7 @@ class Engine:
         self.errlog = None
         self.restarts = 0
         self.fail_streak = 0
+        self.reanchor = False
 
     def shape(self, deg, max_deg):
         dz = self.cfg["deadzone"]
@@ -276,6 +277,9 @@ class Engine:
                 if not sony_hidraw_present():
                     connect_hid_profiles()
                 self._spawn(tracker)
+                # a new tracker calls wherever the head points "zero"; continue from
+                # the last known angles instead of jumping
+                self.reanchor = True
             c = self.cfg
             with self.lock:
                 now = time.monotonic()
@@ -284,6 +288,10 @@ class Engine:
                     if self.want_recenter:
                         self.center = (yaw, pitch, roll)
                         self.want_recenter = False
+                        self.reanchor = False
+                    elif self.reanchor:
+                        self.center = (yaw - self.yaw, pitch - self.pitch, roll - self.roll)
+                        self.reanchor = False
                     self.yaw = (yaw - self.center[0] + 180) % 360 - 180
                     self.pitch = pitch - self.center[1]
                     self.roll = (roll - self.center[2] + 180) % 360 - 180
