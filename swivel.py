@@ -719,6 +719,7 @@ class Engine:
                 hy, hp = y, p
                 break
         ey, ep = hy - cy, hp - cp
+        self._learn_xtalk(now, hy, hp, ey, ep)
         # the XM5 sometimes re-zeroes itself: a big, lasting disagreement is a jump, not drift
         if math.hypot(ey, ep) > CAM_SNAP_DEG:
             self.big_err_since = getattr(self, "big_err_since", None) or now
@@ -734,6 +735,42 @@ class Engine:
         self.yaw -= ey
         self.pitch -= ep
         return True
+
+    def _learn_xtalk(self, now, hy, hp, ey, ep):
+        """Learn how much the headphones' pitch moves when you only turn (and the reverse),
+        using the cameras as the reference: headphones worn at a slight tilt or a calibration
+        turn that dipped the head make turning right read as looking down."""
+        if getattr(self, "cam_trust", 0) < 0.5 or abs(ep) > 10 or abs(ey) > 10:
+            return
+        st = getattr(self, "xt", None)
+        if st is None:
+            st = self.xt = {"yy": 0.0, "ye": 0.0, "y": 0.0, "e": 0.0, "n": 0.0,
+                            "pp": 0.0, "pe": 0.0, "p": 0.0, "f": 0.0, "t": now}
+        d = 0.998  # roughly the last 20 s of samples
+        for k in st:
+            if k != "t":
+                st[k] *= d
+        st["yy"] += hy * hy; st["ye"] += hy * ep; st["y"] += hy; st["e"] += ep; st["n"] += 1
+        st["pp"] += hp * hp; st["pe"] += hp * ey; st["p"] += hp; st["f"] += ey
+        if now - st["t"] < 2.0 or st["n"] < 50:
+            return
+        st["t"] = now
+        k = list(self.cfg.get("xtalk") or (0.0, 0.0))
+        changed = False
+        for i, (xx, xe, x, e) in enumerate(((st["yy"], st["ye"], st["y"], st["e"]),
+                                            (st["pp"], st["pe"], st["p"], st["f"]))):
+            var = xx / st["n"] - (x / st["n"]) ** 2
+            if var < 10 ** 2:  # needs real turns, not sway around center
+                continue
+            slope = (xe / st["n"] - (x / st["n"]) * (e / st["n"])) / var
+            k[i] = max(-0.3, min(0.3, k[i] + 0.3 * slope))
+            changed = True
+        if changed:
+            self.cfg["xtalk"] = k
+            try:
+                CONF.write_text(json.dumps(self.cfg, indent=2))
+            except OSError:
+                pass
 
     def _set_target(self, dt):
         c = self.cfg
@@ -848,6 +885,8 @@ class Engine:
                         self.calib_sink.append((now, self.qr))
                     prev_yaw = self.yaw
                     self.yaw, self.pitch, self.roll = self.decompose(q_rotvec(self.without_roll(self.qr)))
+                    kyp, kpy = self.cfg.get("xtalk") or (0.0, 0.0)  # learned from the cameras
+                    self.yaw, self.pitch = self.yaw - kpy * self.pitch, self.pitch - kyp * self.yaw
                     dt = pkt_dt if 0 < pkt_dt < 0.5 else 0.04
                     speed = abs(self.yaw - prev_yaw) / dt
                     self.assist_on = self._webcam_assist(dt, speed)
@@ -1343,6 +1382,8 @@ class Window(Adw.ApplicationWindow):
             return None
         self.set_cfg("pitch_axis", list(pa))
         self.set_cfg("yaw_axis", list(ya))
+        self.set_cfg("xtalk", None)  # relearned from the cameras for the new axes
+        self.engine.xt = None
         bias = self._measure_bias(self.results.get("still", []))
         self.set_cfg("bias", list(bias) if bias else None)
         # head angles the headphones measured in the holds, with the new axes
