@@ -45,7 +45,8 @@ DEFAULTS = {"yaw_max": 35.0, "pitch_max": 20.0, "deadzone": 0.5, "curve": 1.0,
             "anti_deadzone": 0.2, "smooth": 0.35, "invert_yaw": False,
             "invert_pitch": False, "pad": "playstation", "tracker": "", "drift": 0.5,
             "yaw_axis": None, "pitch_axis": None, "bias": None,
-            "webcam": "off", "cam_device": "/dev/video0", "cam_sign": [1, 1]}
+            "webcam": "off", "cam_device": "/dev/video0", "cam_sign": [1, 1],
+            "ignore_roll": True}
 HISTORY_SECONDS = 10.0
 # Headsets send ~25 reports/s. If they go quiet this long, restart the tracker (it
 # re-enables the sensor). Restarts talk to the headset over Bluetooth, so keep them
@@ -324,6 +325,20 @@ class Engine:
         p = self.cfg.get("pitch_axis") or (0.0, 1.0, 0.0)
         return tuple(y), tuple(p)
 
+    def without_roll(self, q):
+        """Swing-twist split: drop the twist about the head's forward axis (head tilt)."""
+        if not self.cfg.get("ignore_roll", True):
+            return q
+        ya, pa = self.axes()
+        ra = v_norm(v_cross(pa, ya))
+        proj = v_dot(q[1:], ra)
+        tw = (q[0], ra[0] * proj, ra[1] * proj, ra[2] * proj)
+        n = math.sqrt(sum(c * c for c in tw))
+        if n < 1e-9:
+            return q
+        tw = tuple(c / n for c in tw)
+        return q_mul(q, q_conj(tw))
+
     def decompose(self, r):
         """Split a rotation vector into (yaw, pitch, roll) along the head axes.
 
@@ -467,7 +482,7 @@ class Engine:
                         cy = cp = 0.0
                     if self.calib_sink is not None:
                         self.calib_sink.append((now, (cy, cp)))
-                    self.yaw, self.pitch, self.roll = cy, cp, 0.0
+                    self.yaw, self.pitch, self.roll = cy, cp, 0.0  # webcam roll is never used
                     dt = now - last if last and 0 < now - last < 0.5 else 1 / 30
                     last = now
                     self._set_target(dt)
@@ -613,7 +628,7 @@ class Engine:
                     if self.calib_sink is not None:
                         self.calib_sink.append((now, self.qr))
                     prev_yaw = self.yaw
-                    self.yaw, self.pitch, self.roll = self.decompose(q_rotvec(self.qr))
+                    self.yaw, self.pitch, self.roll = self.decompose(q_rotvec(self.without_roll(self.qr)))
                     dt = pkt_dt if 0 < pkt_dt < 0.5 else 0.04
                     speed = abs(self.yaw - prev_yaw) / dt
                     if not self._webcam_assist(dt, speed):
@@ -878,6 +893,7 @@ class Window(Adw.ApplicationWindow):
 
         GLib.idle_add(hook_cam_row)
         ctl.add(cam_row)
+        self._switch(ctl, "Ignore head tilt (roll)", "ignore_roll")
         self.inv_rows = {k: self._switch(ctl, t, k) for t, k in
                          (("Invert yaw", "invert_yaw"), ("Invert pitch", "invert_pitch"))}
         self.axes_row = Adw.ActionRow(title="Head axes")
