@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Swivel
+Comment=Head tracking from Sony headphones as a gamepad's right stick
+Exec=@EXEC@
+Icon=@ICON@
+Terminal=false
+Categories=Game;
+Keywords=head tracking;headphones;gamepad;sony;camera;
+StartupWMClass=io.github.trongio.Swivel

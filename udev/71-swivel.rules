@@ -1,0 +1,8 @@
+# Swivel: give the logged-in user access without root.
+#
+# Sony headsets over Bluetooth show up as hidraw on bus 0005 with vendor 054C.
+# (Rules that match ATTRS{idVendor} only work for USB, never for Bluetooth.)
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", KERNELS=="0005:054C:*", MODE="0660", TAG+="uaccess"
+
+# The virtual controller is created through uinput.
+KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", TAG+="uaccess", OPTIONS+="static_node=uinput"
