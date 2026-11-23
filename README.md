@@ -18,10 +18,9 @@ both.
 - Tuning that applies instantly: range, deadzone, response curve, smoothing, and
   **game deadzone compensation** (skips the game's own dead stick zone so small
   head turns register instead of feeling sticky)
-- Xbox (default) or PlayStation virtual controller. Keep Xbox when you play with a
-  real DualSense: under Proton a fake PlayStation pad can confuse a game's native
-  DualSense support and scramble the buttons. Swivel only sends input when your head
-  moves, so it doesn't keep stealing the "active controller" from your real pad
+- PlayStation (default) or Xbox virtual controller. If your buttons get scrambled
+  with Steam Input on, switch to Xbox. Swivel only sends input when your head moves,
+  so it doesn't keep stealing the "active controller" from your real pad
 - **Calibrate** button: look straight, up, then right when prompted, and Swivel learns
   how the headset's sensor sits on your head. Fixes nodding showing up as turning
   (or roll), which happens because the sensor in the ear cup is tilted
