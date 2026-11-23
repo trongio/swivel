@@ -284,6 +284,7 @@ class CamSource:
         self.sock = self.log = self.proc = None
         self.last = None
 CAM_STALE = 0.4  # seconds; older webcam poses are ignored
+CAM_DISAGREE = 12.0  # degrees; beyond this the cameras are not averaged
 CAM_TAU = 1.5  # seconds; how fast the webcam pulls the headphone center back
 CAM_MAX_SPEED_DPS = 40.0  # only correct while the head moves slower than this
 CAM_MAX_ANGLE = 25.0  # only trust face tracking this close to center
@@ -575,8 +576,19 @@ class Engine:
         now = time.monotonic()
         fresh = [s.last for s in self.srcs.values() if s.last and now - s.last[0] < CAM_STALE]
         if not fresh:
+            self._cam_prev = None
             return None
-        return (max(f[0] for f in fresh), sum(f[1] for f in fresh) / len(fresh), sum(f[2] for f in fresh) / len(fresh))
+        prev = getattr(self, "_cam_prev", None)
+        if len(fresh) > 1 and prev is not None:
+            spread = max(max(f[1] for f in fresh) - min(f[1] for f in fresh),
+                         max(f[2] for f in fresh) - min(f[2] for f in fresh))
+            if spread > CAM_DISAGREE:
+                # one camera is misreading (bad angle, partial view): trust the one that
+                # continues from where the head just was instead of averaging the outlier in
+                fresh = [min(fresh, key=lambda f: abs(f[1] - prev[1]) + abs(f[2] - prev[2]))]
+        out = (max(f[0] for f in fresh), sum(f[1] for f in fresh) / len(fresh), sum(f[2] for f in fresh) / len(fresh))
+        self._cam_prev = out
+        return out
 
     @property
     def cam_status(self):
@@ -636,6 +648,7 @@ class Engine:
                     self._set_target(dt)
                     self.last_packet = now
                     self.status = "Tracking (camera)"
+                    self._trace(now, 0.0)
                     if not self.history or now - self.history[-1][0] >= 0.02:
                         self.history.append((now, self.yaw, self.pitch, self.roll))
 
@@ -646,15 +659,22 @@ class Engine:
         try:
             if self.trace is None:
                 self.trace = open(Path(GLib.get_user_runtime_dir()) / "swivel-trace.csv", "w", buffering=1)
-                self.trace.write("t,yaw,pitch,cam_yaw,cam_pitch,cam_age,assist,speed,stick_x,stick_y,restarts,recenters\n")
+                self.trace.write("t,yaw,pitch,cam_yaw,cam_pitch,cam_age,assist,speed,stick_x,stick_y,restarts,recenters,"
+                                 "pc_yaw,pc_pitch,phone_yaw,phone_pitch\n")
             cam = self.cam
             cy, cp, age = (cam[1], cam[2], now - cam[0]) if cam else ("", "", "")
             self.trace.write(f"{now:.2f},{self.yaw:.2f},{self.pitch:.2f},{cy if cy == '' else f'{cy:.2f}'},"
                              f"{cp if cp == '' else f'{cp:.2f}'},{age if age == '' else f'{age:.2f}'},"
                              f"{int(self.assist_on)},{speed:.0f},{self.sx:.3f},{self.sy:.3f},"
-                             f"{self.restarts},{self.recenters}\n")
+                             f"{self.restarts},{self.recenters},{self._src_trace('pc')},{self._src_trace('phone')}\n")
         except OSError:
             pass
+
+    def _src_trace(self, name):
+        src = self.srcs.get(name)
+        if not src or not src.last or time.monotonic() - src.last[0] > CAM_STALE:
+            return ","
+        return f"{src.last[1]:.2f},{src.last[2]:.2f}"
 
     def _webcam_assist(self, dt, speed):
         """Pull the headphone center toward the webcam's drift-free view of the head."""
