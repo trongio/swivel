@@ -129,8 +129,7 @@ class OpenTrackNN:
         mx, my, mz = self.rotvec(outs[1]["quat"][0])
         # mirroring negates rotation about the vertical (y) and viewing (z) axes
         rx, ry, rz = (rx + mx) / 2, (ry - my) / 2, (rz - mz) / 2
-        rx, ry, rz = self.line_of_sight(rx, ry, rz, cx, cy, gray.shape[1], gray.shape[0])
-        return ry, rx, rz  # yaw about the vertical image axis, pitch about horizontal
+        return self.line_of_sight(rx, ry, rz, cx, cy, gray.shape[1], gray.shape[0])
 
     def line_of_sight(self, rx, ry, rz, x, y, w, h):
         """The net reads the head's rotation relative to the line from the camera to the head,
@@ -151,7 +150,19 @@ class OpenTrackNN:
         w2, x2, y2, z2 = qm
         q = (w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2, w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
              w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2, w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2)
-        return self.rotvec((q[1], q[2], q[3], q[0]))
+        return nose_angles(q)
+
+
+def nose_angles(q):
+    """(yaw, pitch, roll) in degrees from where the nose points. Unlike rotation-vector parts,
+    yaw and pitch stay put when the head tilts sideways."""
+    w, x, y, z = q
+    fx, fy, fz = -2 * (x * z + w * y), -2 * (y * z - w * x), -(1 - 2 * (x * x + y * y))
+    yaw = math.degrees(math.atan2(-fx, -fz))
+    pitch = math.degrees(math.atan2(fy, math.hypot(fx, fz)))
+    # roll: the head's own sideways tilt, only shown, never used
+    roll = math.degrees(math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)))
+    return yaw, pitch, roll
 
     @staticmethod
     def rotvec(q):

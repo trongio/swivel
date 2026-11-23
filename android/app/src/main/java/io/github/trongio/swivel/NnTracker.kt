@@ -190,8 +190,7 @@ class NnTracker(context: Context, private val onPose: (Pose, Long) -> Unit) {
             // mirroring negates rotation about the vertical (y) and viewing (z) axes
             r = doubleArrayOf((r[0] + rm[0]) / 2, (r[1] - rm[1]) / 2, (r[2] - rm[2]) / 2)
         }
-        r = lineOfSight(r, cx.toDouble(), cy.toDouble())
-        return doubleArrayOf(r[1], r[0], r[2])
+        return lineOfSight(r, cx.toDouble(), cy.toDouble())
     }
 
     /** Diagonal field of view of the front camera (Galaxy S22 Ultra: about 80 degrees). */
@@ -217,12 +216,16 @@ class NnTracker(context: Context, private val onPose: (Pose, Long) -> Unit) {
                  else doubleArrayOf(1.0, 0.0, 0.0, 0.0)
         val (w1, x1, y1, z1) = qc
         val (w2, x2, y2, z2) = qm
-        val q = floatArrayOf(
-            (w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2).toFloat(),
-            (w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2).toFloat(),
-            (w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2).toFloat(),
-            (w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2).toFloat())
-        return rotvec(q)
+        val w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+        val x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+        val y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+        val z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+        // yaw and pitch from where the nose points: they stay put when the head tilts sideways
+        val fx = -2 * (x * z + w * y); val fy = -2 * (y * z - w * x); val fz = -(1 - 2 * (x * x + y * y))
+        val yaw = Math.toDegrees(atan2(-fx, -fz))
+        val pitch = Math.toDegrees(atan2(fy, sqrt(fx * fx + fz * fz)))
+        val roll = Math.toDegrees(atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)))
+        return doubleArrayOf(yaw, pitch, roll)
     }
 
     fun close() { loc.close(); pose.close() }
