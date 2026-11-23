@@ -284,6 +284,7 @@ class CamSource:
                 f.close()
         self.sock = self.log = self.proc = None
         self.last = None
+TRACE_DT = float(os.environ.get("SWIVEL_TRACE_DT", "0.2"))  # seconds between trace rows
 CAM_STALE = 0.4  # seconds; older webcam poses are ignored
 CAM_DISAGREE = 12.0  # degrees; beyond this the cameras are not averaged
 CAM_TAU = 2.0  # seconds; how fast the cameras pull the headphone center back
@@ -292,7 +293,7 @@ CAM_MIN_TRUST = 0.3  # combined camera trust needed before correcting
 CAM_SNAP_DEG = 12.0  # headphones this far off for CAM_SNAP_S: they jumped, snap back
 CAM_SNAP_S = 0.6
 CAM_FRONTAL = 30.0  # degrees off the camera's axis where its trust halves
-CAM_LAG = 0.15  # seconds; camera poses describe the head this long ago
+CAM_LAG = {"pc": 0.10, "phone": 0.22}  # seconds behind the headphones (measured)
 
 
 def frontal_weight(yaw, pitch):
@@ -655,7 +656,8 @@ class Engine:
                     src.center = (yaw, pitch)
                     src.want_recenter = False
                 gy, gp = self.source_gain(src.name)
-                src.last = (now, gy * (yaw - src.center[0]), gp * (pitch - src.center[1]))
+                # stamped with when the head was there, not when the pose arrived
+                src.last = (now - CAM_LAG.get(src.name, 0.15), gy * (yaw - src.center[0]), gp * (pitch - src.center[1]))
                 src.status = "tracking"
                 if self.mode() == "control":
                     _t, cy, cp = self.cam or src.last
@@ -673,7 +675,7 @@ class Engine:
                         self.history.append((now, self.yaw, self.pitch, self.roll))
 
     def _trace(self, now, speed):
-        if now - self.trace_t < 0.2:
+        if now - self.trace_t < TRACE_DT:
             return
         self.trace_t = now
         try:
@@ -711,7 +713,7 @@ class Engine:
         # compare with where the headphones said the head was when the camera frame was
         # taken, not now; otherwise the camera's lag pulls against every head turn
         hy, hp = self.yaw, self.pitch
-        when = t - CAM_LAG
+        when = t
         for ht, y, p, _r in reversed(self.history):
             if ht <= when:
                 hy, hp = y, p
@@ -723,7 +725,7 @@ class Engine:
             if now - self.big_err_since > CAM_SNAP_S:
                 k = 1.0
                 self.big_err_since = None
-                self.snap_hold = now + CAM_LAG + 0.1  # history predates the snap
+                self.snap_hold = now + 0.35  # history predates the snap
                 self.snaps = getattr(self, "snaps", 0) + 1
         else:
             self.big_err_since = None
