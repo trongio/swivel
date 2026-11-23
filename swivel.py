@@ -270,6 +270,7 @@ class CamSource:
         self.last = None  # (time, yaw, pitch) relative to center, gain applied
         self.status = ""
         self.link = ""
+        self.w = 1.0  # trust, from how squarely this camera sees the face (smoothed)
 
     def close(self):
         if self.proc and self.proc.poll() is None:
@@ -288,6 +289,15 @@ CAM_DISAGREE = 12.0  # degrees; beyond this the cameras are not averaged
 CAM_TAU = 1.5  # seconds; how fast the webcam pulls the headphone center back
 CAM_MAX_SPEED_DPS = 40.0  # only correct while the head moves slower than this
 CAM_MAX_ANGLE = 25.0  # only trust face tracking this close to center
+CAM_FRONTAL = 30.0  # degrees off the camera's axis where its trust halves
+CAM_LAG = 0.15  # seconds; camera poses describe the head this long ago
+
+
+def frontal_weight(yaw, pitch):
+    """Head-pose nets are accurate facing the camera and fall apart toward profile or
+    looking past it (a camera below sees mostly chin when you look up)."""
+    a = math.hypot(yaw, pitch)
+    return 0.0 if a > 60 else 1.0 / (1.0 + (a / CAM_FRONTAL) ** 4)
 
 
 def find_uv():
@@ -572,23 +582,21 @@ class Engine:
 
     @property
     def cam(self):
-        """Combined camera view (time, yaw, pitch): average of the cameras that see the head now."""
+        """Combined camera view (time, yaw, pitch): the cameras that see the head now, each
+        weighted by how squarely it sees the face."""
         now = time.monotonic()
-        fresh = [s.last for s in self.srcs.values() if s.last and now - s.last[0] < CAM_STALE]
+        fresh = [(s.last, max(s.w, 1e-3)) for s in self.srcs.values() if s.last and now - s.last[0] < CAM_STALE]
         if not fresh:
-            self._cam_prev = None
             return None
-        prev = getattr(self, "_cam_prev", None)
-        if len(fresh) > 1 and prev is not None:
-            spread = max(max(f[1] for f in fresh) - min(f[1] for f in fresh),
-                         max(f[2] for f in fresh) - min(f[2] for f in fresh))
+        if len(fresh) > 1:
+            spread = max(max(f[1] for f, _ in fresh) - min(f[1] for f, _ in fresh),
+                         max(f[2] for f, _ in fresh) - min(f[2] for f, _ in fresh))
             if spread > CAM_DISAGREE:
-                # one camera is misreading (bad angle, partial view): trust the one that
-                # continues from where the head just was instead of averaging the outlier in
-                fresh = [min(fresh, key=lambda f: abs(f[1] - prev[1]) + abs(f[2] - prev[2]))]
-        out = (max(f[0] for f in fresh), sum(f[1] for f in fresh) / len(fresh), sum(f[2] for f in fresh) / len(fresh))
-        self._cam_prev = out
-        return out
+                # one camera is misreading: keep the one with the more frontal view
+                fresh = [max(fresh, key=lambda fw: fw[1])]
+        tw = sum(w for _, w in fresh)
+        return (max(f[0] for f, _ in fresh), sum(f[1] * w for f, w in fresh) / tw,
+                sum(f[2] * w for f, w in fresh) / tw)
 
     @property
     def cam_status(self):
@@ -627,6 +635,7 @@ class Engine:
                     src.status = "no face"
                     continue
                 src.raw = (now, yaw, pitch)
+                src.w += 0.25 * (frontal_weight(yaw, pitch) - src.w)  # eased, so the blend never jumps
                 if self.mode() == "control" and self.want_recenter:
                     for s in self.srcs.values():
                         s.want_recenter = True
@@ -660,7 +669,7 @@ class Engine:
             if self.trace is None:
                 self.trace = open(Path(GLib.get_user_runtime_dir()) / "swivel-trace.csv", "w", buffering=1)
                 self.trace.write("t,yaw,pitch,cam_yaw,cam_pitch,cam_age,assist,speed,stick_x,stick_y,restarts,recenters,"
-                                 "pc_yaw,pc_pitch,phone_yaw,phone_pitch\n")
+                                 "pc_yaw,pc_pitch,pc_w,phone_yaw,phone_pitch,phone_w\n")
             cam = self.cam
             cy, cp, age = (cam[1], cam[2], now - cam[0]) if cam else ("", "", "")
             self.trace.write(f"{now:.2f},{self.yaw:.2f},{self.pitch:.2f},{cy if cy == '' else f'{cy:.2f}'},"
@@ -673,8 +682,8 @@ class Engine:
     def _src_trace(self, name):
         src = self.srcs.get(name)
         if not src or not src.last or time.monotonic() - src.last[0] > CAM_STALE:
-            return ","
-        return f"{src.last[1]:.2f},{src.last[2]:.2f}"
+            return ",,"
+        return f"{src.last[1]:.2f},{src.last[2]:.2f},{src.w:.2f}"
 
     def _webcam_assist(self, dt, speed):
         """Pull the headphone center toward the webcam's drift-free view of the head."""
@@ -687,7 +696,15 @@ class Engine:
             return False
         k = min(1.0, dt / CAM_TAU)
         ya, pa = self.axes()
-        ey, ep = (self.yaw - cy) * k, (self.pitch - cp) * k
+        # compare with where the headphones said the head was when the camera frame was
+        # taken, not now; otherwise the camera's lag pulls against every head turn
+        hy, hp = self.yaw, self.pitch
+        when = t - CAM_LAG
+        for ht, y, p, _r in reversed(self.history):
+            if ht <= when:
+                hy, hp = y, p
+                break
+        ey, ep = (hy - cy) * k, (hp - cp) * k
         self.qc = q_mul(q_mul(self.qc, q_axis_angle(ya, ey)), q_axis_angle(pa, ep))
         self.yaw -= ey
         self.pitch -= ep
