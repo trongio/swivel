@@ -762,13 +762,27 @@ class Canvas(Gtk.Widget):
 SOUND_DIR = Path("/usr/share/sounds/freedesktop/stereo")
 
 
-def cue(sound=None, say=None):
-    """Play a short freedesktop sound and/or speak a phrase, without blocking."""
+VOICE_DIR = HERE / "sounds"
+
+
+def _play(path):
+    player = shutil.which("paplay") or shutil.which("pw-play")
+    if player and path.exists():
+        subprocess.Popen([player, str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    return False
+
+
+def cue(sound=None, say=None, clip=None):
+    """Play a chime and/or a voice prompt without blocking.
+
+    `clip` names a recorded prompt in sounds/ (e.g. "calib-up"); if it's missing,
+    `say` is spoken with spd-say instead.
+    """
     if sound:
-        f = SOUND_DIR / f"{sound}.oga"
-        player = shutil.which("paplay") or shutil.which("pw-play")
-        if player and f.exists():
-            subprocess.Popen([player, str(f)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _play(SOUND_DIR / f"{sound}.oga")
+    if clip and _play(VOICE_DIR / f"{clip}.ogg"):
+        return
     if say and shutil.which("spd-say"):
         subprocess.Popen(["spd-say", "-r", "10", say], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -954,7 +968,7 @@ class Window(Adw.ApplicationWindow):
         e.calibrating = True
         self.calib_steps = True  # keeps status messages pinned
         self.calib_msg = self.CALIB_PROMPTS["still"]
-        cue(say=self.CALIB_SPOKEN["still"])
+        cue(say=self.CALIB_SPOKEN["still"], clip="calib-start")
         self.calib_button.set_label("Next")
         self.cancel_button.set_visible(True)
         GLib.timeout_add(33, self._cam_sample)
@@ -972,7 +986,7 @@ class Window(Adw.ApplicationWindow):
         if stage == "still":
             self.engine.want_recenter = True
             secs, msg = 3.0, "Hold still"
-            cue(say="Hold still.")
+            cue(say="Hold still.", clip="calib-hold-still")
         else:
             secs, msg = 0.7, "Hold it"
         self.engine.calib_sink = []
@@ -992,7 +1006,7 @@ class Window(Adw.ApplicationWindow):
             if i + 1 < len(self.CALIB_ORDER):
                 self.calib_stage = self.CALIB_ORDER[i + 1]
                 self.calib_msg = self.CALIB_PROMPTS[self.calib_stage]
-                cue("message", self.CALIB_SPOKEN[self.calib_stage])
+                cue("message", self.CALIB_SPOKEN[self.calib_stage], clip=f"calib-{self.calib_stage}")
             else:
                 self._calib_end_ui()
                 self._calib_finish()
@@ -1042,12 +1056,13 @@ class Window(Adw.ApplicationWindow):
         up, right = mean_rotvec(self.results.get("up", [])), mean_rotvec(self.results.get("right", []))
         mu, mr = math.sqrt(v_dot(up, up)), math.sqrt(v_dot(right, right))
         if mu < 8 or mr < 8:
-            cue("dialog-warning", "Calibration failed. Turn your head further and try again.")
+            cue("dialog-warning", "Calibration failed. Turn your head further and try again.",
+                clip="calib-failed-further")
             self._flash("Calibration failed: turn your head further (at least ~15°) and hold it")
             return
         pa, ya = v_norm(up), v_norm(right)
         if abs(v_dot(pa, ya)) > 0.9:
-            cue("dialog-warning", "Calibration failed. Try again.")
+            cue("dialog-warning", "Calibration failed. Try again.", clip="calib-failed")
             self._flash("Calibration failed: up and right looked the same, try again")
             return
         self.set_cfg("pitch_axis", list(pa))
@@ -1062,7 +1077,7 @@ class Window(Adw.ApplicationWindow):
         self.engine.want_recenter = True
         self._update_axes_row()
         self._flash("Calibrated. Up/down and left/right now follow your head" + (f". {cam_msg}" if cam_msg else ""))
-        cue("complete", "Calibrated. Look at the screen.")
+        cue("complete", "Calibrated. Look at the screen.", clip="calib-done")
 
     def _calib_cam_signs(self, hp_yaw, hp_pitch):
         """Learn the webcam's direction and scale: webcam degrees -> headphone degrees."""

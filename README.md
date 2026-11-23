@@ -99,4 +99,4 @@ through Proton. Other Sony models that `sony-tracker` supports should work the s
 
 ## License
 
-MIT
+MIT. Voice prompts in `sounds/` were generated with ElevenLabs (voice: River).

@@ -25,6 +25,10 @@ EOF
 mkdir -p "$DEST" "$APPS"
 install -m755 "$SRC/swivel.py" "$DEST/swivel.py"
 install -m755 "$SRC/swivel_cam.py" "$DEST/swivel_cam.py"
+if [[ -d $SRC/sounds ]]; then
+  mkdir -p "$DEST/sounds"
+  install -m644 "$SRC"/sounds/*.ogg "$DEST/sounds/" 2>/dev/null || true
+fi
 install -m644 "$SRC/data/io.github.trongio.Swivel.svg" "$DEST/swivel.svg"
 
 # sony-tracker does the actual headset reading
