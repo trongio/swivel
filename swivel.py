@@ -1134,12 +1134,14 @@ class Window(Adw.ApplicationWindow):
         "still": "Look straight at the screen, then press Next (or F8)",
         "up": "Look UP and hold it, then press Next (or F8)",
         "right": "Look RIGHT and hold it, then press Next (or F8)",
+        "center": "Look straight at the screen, then press Next (or F8) to set the center",
     }
     CALIB_ORDER = ["still", "up", "right"]
     CALIB_SPOKEN = {
         "still": "Look straight at the screen, then press F 8.",
         "up": "Now look up and hold, then press F 8.",
         "right": "Now look right and hold, then press F 8.",
+        "center": "Look straight at the screen, then press F 8.",
     }
 
     def start_calibration(self):
@@ -1170,6 +1172,14 @@ class Window(Adw.ApplicationWindow):
             self._calib_abort("Calibration stopped: tracking is off")
             return
         stage = self.calib_stage
+        if stage == "center":
+            # set the center only now, while actually facing the screen
+            self.engine.want_recenter = True
+            self.engine.cam_want_recenter = True
+            self._calib_end_ui()
+            self._flash(self.calib_result)
+            cue("complete", "Calibrated.", clip="calib-done")
+            return
         self.calib_busy = True
         cue("audio-volume-change")
         if stage == "still":
@@ -1191,14 +1201,21 @@ class Window(Adw.ApplicationWindow):
                 return True
             self._calib_take(stage)
             self.calib_busy = False
+            if stage == "right":
+                self.engine.calibrating = False
+                result = self._calib_finish()
+                if result is None:  # failed; message already shown
+                    self._calib_end_ui()
+                    return False
+                self.calib_result = result
+                self.calib_stage = "center"
+                self.calib_msg = self.CALIB_PROMPTS["center"]
+                cue("message", self.CALIB_SPOKEN["center"], clip="calib-start")
+                return False
             i = self.CALIB_ORDER.index(stage)
-            if i + 1 < len(self.CALIB_ORDER):
-                self.calib_stage = self.CALIB_ORDER[i + 1]
-                self.calib_msg = self.CALIB_PROMPTS[self.calib_stage]
-                cue("message", self.CALIB_SPOKEN[self.calib_stage], clip=f"calib-{self.calib_stage}")
-            else:
-                self._calib_end_ui()
-                self._calib_finish()
+            self.calib_stage = self.CALIB_ORDER[i + 1]
+            self.calib_msg = self.CALIB_PROMPTS[self.calib_stage]
+            cue("message", self.CALIB_SPOKEN[self.calib_stage], clip=f"calib-{self.calib_stage}")
             return False
 
         GLib.timeout_add(100, tick)
@@ -1233,13 +1250,14 @@ class Window(Adw.ApplicationWindow):
         self._flash(msg)
 
     def _calib_finish(self):
-        self.calib_steps = None
-        self.engine.calibrating = False
+        """Compute the calibration from the holds. Returns a summary, or None on failure."""
         if self.engine.mode() == "control":
             cam_msg = self._calib_cam_signs(None, None)
-            self.engine.want_recenter = True
-            self._flash(cam_msg or "Calibration failed: the webcam didn't see your face")
-            return
+            if not cam_msg or "calibrated" not in cam_msg:
+                self._flash(cam_msg or "Calibration failed: no camera saw your face")
+                cue("dialog-warning", "Calibration failed. Try again.", clip="calib-failed")
+                return None
+            return cam_msg
 
         def mean_rotvec(samples):
             vs = [q_rotvec(q) for _t, q in samples]
@@ -1251,12 +1269,12 @@ class Window(Adw.ApplicationWindow):
             cue("dialog-warning", "Calibration failed. Turn your head further and try again.",
                 clip="calib-failed-further")
             self._flash("Calibration failed: turn your head further (at least ~15°) and hold it")
-            return
+            return None
         pa, ya = v_norm(up), v_norm(right)
         if abs(v_dot(pa, ya)) > 0.9:
             cue("dialog-warning", "Calibration failed. Try again.", clip="calib-failed")
             self._flash("Calibration failed: up and right looked the same, try again")
-            return
+            return None
         self.set_cfg("pitch_axis", list(pa))
         self.set_cfg("yaw_axis", list(ya))
         bias = self._measure_bias(self.results.get("still", []))
@@ -1266,10 +1284,8 @@ class Window(Adw.ApplicationWindow):
         cam_msg = self._calib_cam_signs(hp[0][0], hp[1][1])
         for row in self.inv_rows.values():
             row.set_active(False)  # calibration already defines up = up, right = right
-        self.engine.want_recenter = True
         self._update_axes_row()
-        self._flash("Calibrated. Up/down and left/right now follow your head" + (f". {cam_msg}" if cam_msg else ""))
-        cue("complete", "Calibrated. Look at the screen.", clip="calib-done")
+        return "Calibrated. Up/down and left/right now follow your head" + (f". {cam_msg}" if cam_msg else "")
 
     def _calib_cam_signs(self, hp_yaw, hp_pitch):
         """Learn each camera's direction and scale: camera degrees -> headphone degrees."""
@@ -1286,6 +1302,17 @@ class Window(Adw.ApplicationWindow):
             return g if 0.4 <= abs(g) <= 2.5 else (1.0 if g > 0 else -1.0)
 
         gains = dict(self.cfg.get("cam_gain") or {})
+        if hp_yaw is None:
+            # no headphones: scale every camera to the cameras' average turn, so they agree
+            ys, ps = [], []
+            for name in names:
+                st, u, r = ((self.results.get(k) or {}).get(name) for k in ("cam_still", "cam_up", "cam_right"))
+                if st and u and r:
+                    by, bp = sum(v[0] for v in st) / len(st), sum(v[1] for v in st) / len(st)
+                    ys.append(abs(sum(v[0] for v in r) / len(r) - by))
+                    ps.append(abs(sum(v[1] for v in u) / len(u) - bp))
+            if ys:
+                hp_yaw, hp_pitch = sum(ys) / len(ys), sum(ps) / len(ps)
         for name in sorted(names):
             still, up, right = ((self.results.get(k) or {}).get(name) for k in ("cam_still", "cam_up", "cam_right"))
             label = {"pc": "Webcam", "phone": "Phone"}.get(name, name)
@@ -1305,7 +1332,6 @@ class Window(Adw.ApplicationWindow):
         dbg_path.write_text(json.dumps(dbg))
         if done:
             self.set_cfg("cam_gain", gains)
-            self.engine.cam_want_recenter = True
         if not names:
             return ""
         return ", ".join(([f"{' and '.join(done)} calibrated"] if done else []) + msgs)
