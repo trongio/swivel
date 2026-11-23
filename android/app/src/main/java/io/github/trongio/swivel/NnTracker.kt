@@ -39,7 +39,14 @@ class NnTracker(context: Context, private val onPose: (Pose, Long) -> Unit) {
     init {
         fun session(name: String): OrtSession {
             val bytes = context.assets.open(name).use { it.readBytes() }
-            // Try the phone's NN accelerator first (NNAPI), then XNNPACK on the CPU.
+            // Qualcomm NPU (QNN HTP) first, then NNAPI, then XNNPACK on the CPU.
+            try {
+                val qnn = OrtSession.SessionOptions().apply {
+                    addQnn(mapOf("backend_path" to "libQnnHtp.so", "enable_htp_fp16_precision" to "1",
+                        "htp_performance_mode" to "burst"))
+                }
+                return env.createSession(bytes, qnn).also { accel = "NPU" }
+            } catch (e: Exception) { android.util.Log.w("Swivel", "QNN unavailable for $name", e) }
             try {
                 val nn = OrtSession.SessionOptions().apply { addNnapi() }
                 return env.createSession(bytes, nn).also { accel = "NNAPI" }
