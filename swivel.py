@@ -286,9 +286,11 @@ class CamSource:
         self.last = None
 CAM_STALE = 0.4  # seconds; older webcam poses are ignored
 CAM_DISAGREE = 12.0  # degrees; beyond this the cameras are not averaged
-CAM_TAU = 1.5  # seconds; how fast the webcam pulls the headphone center back
-CAM_MAX_SPEED_DPS = 40.0  # only correct while the head moves slower than this
-CAM_MAX_ANGLE = 25.0  # only trust face tracking this close to center
+CAM_TAU = 2.0  # seconds; how fast the cameras pull the headphone center back
+CAM_MAX_SPEED_DPS = 150.0  # skip corrections during very fast turns (motion blur)
+CAM_MIN_TRUST = 0.3  # combined camera trust needed before correcting
+CAM_SNAP_DEG = 12.0  # headphones this far off for CAM_SNAP_S: they jumped, snap back
+CAM_SNAP_S = 0.6
 CAM_FRONTAL = 30.0  # degrees off the camera's axis where its trust halves
 CAM_LAG = 0.15  # seconds; camera poses describe the head this long ago
 
@@ -595,6 +597,7 @@ class Engine:
                 # one camera is misreading: keep the one with the more frontal view
                 fresh = [max(fresh, key=lambda fw: fw[1])]
         tw = sum(w for _, w in fresh)
+        self.cam_trust = max(w for _, w in fresh)
         return (max(f[0] for f, _ in fresh), sum(f[1] * w for f, w in fresh) / tw,
                 sum(f[2] * w for f, w in fresh) / tw)
 
@@ -669,13 +672,13 @@ class Engine:
             if self.trace is None:
                 self.trace = open(Path(GLib.get_user_runtime_dir()) / "swivel-trace.csv", "w", buffering=1)
                 self.trace.write("t,yaw,pitch,cam_yaw,cam_pitch,cam_age,assist,speed,stick_x,stick_y,restarts,recenters,"
-                                 "pc_yaw,pc_pitch,pc_w,phone_yaw,phone_pitch,phone_w\n")
+                                 "pc_yaw,pc_pitch,pc_w,phone_yaw,phone_pitch,phone_w,snaps\n")
             cam = self.cam
             cy, cp, age = (cam[1], cam[2], now - cam[0]) if cam else ("", "", "")
             self.trace.write(f"{now:.2f},{self.yaw:.2f},{self.pitch:.2f},{cy if cy == '' else f'{cy:.2f}'},"
                              f"{cp if cp == '' else f'{cp:.2f}'},{age if age == '' else f'{age:.2f}'},"
                              f"{int(self.assist_on)},{speed:.0f},{self.sx:.3f},{self.sy:.3f},"
-                             f"{self.restarts},{self.recenters},{self._src_trace('pc')},{self._src_trace('phone')}\n")
+                             f"{self.restarts},{self.recenters},{self._src_trace('pc')},{self._src_trace('phone')},{getattr(self, "snaps", 0)}\n")
         except OSError:
             pass
 
@@ -690,9 +693,10 @@ class Engine:
         if self.mode() != "assist" or self.calibrating or not self.cam or not 0 < dt < 0.5:
             return False
         t, cy, cp = self.cam
-        if time.monotonic() - t > CAM_STALE or speed > CAM_MAX_SPEED_DPS:
+        now = time.monotonic()
+        if now - t > CAM_STALE or speed > CAM_MAX_SPEED_DPS or now < getattr(self, "snap_hold", 0):
             return False
-        if abs(cy) > CAM_MAX_ANGLE or abs(cp) > CAM_MAX_ANGLE:
+        if getattr(self, "cam_trust", 1.0) < CAM_MIN_TRUST:
             return False
         k = min(1.0, dt / CAM_TAU)
         ya, pa = self.axes()
@@ -704,7 +708,18 @@ class Engine:
             if ht <= when:
                 hy, hp = y, p
                 break
-        ey, ep = (hy - cy) * k, (hp - cp) * k
+        ey, ep = hy - cy, hp - cp
+        # the XM5 sometimes re-zeroes itself: a big, lasting disagreement is a jump, not drift
+        if math.hypot(ey, ep) > CAM_SNAP_DEG:
+            self.big_err_since = getattr(self, "big_err_since", None) or now
+            if now - self.big_err_since > CAM_SNAP_S:
+                k = 1.0
+                self.big_err_since = None
+                self.snap_hold = now + CAM_LAG + 0.1  # history predates the snap
+                self.snaps = getattr(self, "snaps", 0) + 1
+        else:
+            self.big_err_since = None
+        ey, ep = ey * k, ep * k
         self.qc = q_mul(q_mul(self.qc, q_axis_angle(ya, ey)), q_axis_angle(pa, ep))
         self.yaw -= ey
         self.pitch -= ep
