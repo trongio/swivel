@@ -44,7 +44,7 @@ import java.util.concurrent.Executors
 class MainActivity : ComponentActivity() {
     private val analysisExecutor = Executors.newSingleThreadExecutor()
     private val streamer = Streamer()
-    private var tracker: HeadTracker? = null
+    private var tracker: NnTracker? = null
 
     private var pose by mutableStateOf(Pose(0.0, 0.0, 0.0, false))
     private var fps by mutableStateOf(0.0)
@@ -61,7 +61,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         streamer.start()
-        tracker = HeadTracker(this) { p, _ ->
+        tracker = NnTracker(this) { p, _ ->
             streamer.send(p)
             pose = p
             frames++
@@ -80,7 +80,7 @@ class MainActivity : ComponentActivity() {
         future.addListener({
             val provider = future.get()
             val res = ResolutionSelector.Builder()
-                .setResolutionStrategy(ResolutionStrategy(Size(1280, 720), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
+                .setResolutionStrategy(ResolutionStrategy(Size(640, 480), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
                 .build()
             val analysis = ImageAnalysis.Builder()
                 .setResolutionSelector(res)
@@ -122,7 +122,7 @@ class MainActivity : ComponentActivity() {
                         color = Color.White, fontSize = 18.sp)
                     Text("yaw %+.1f°   pitch %+.1f°   roll %+.1f°".format(pose.yaw, pose.pitch, pose.roll),
                         color = Color(0xFFDEDDDA), fontSize = 18.sp)
-                    Text("%.0f fps".format(fps), color = Color(0xFF9A9996), fontSize = 16.sp)
+                    Text("%.0f fps · %s".format(fps, tracker?.accel ?: ""), color = Color(0xFF9A9996), fontSize = 16.sp)
                     Text("Put the phone under your monitor, facing you. Keep this app open.",
                         color = Color(0xFF9A9996), fontSize = 14.sp)
                 }

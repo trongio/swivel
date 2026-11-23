@@ -28,7 +28,7 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
     buildFeatures { compose = true }
-    androidResources { noCompress += "task" }
+    androidResources { noCompress += listOf("task", "onnx") }
 }
 
 dependencies {
@@ -43,4 +43,5 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:$camerax")
     implementation("androidx.camera:camera-view:$camerax")
     implementation("com.google.mediapipe:tasks-vision:0.10.21")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
 }
