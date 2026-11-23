@@ -43,7 +43,8 @@ PIDFILE = Path(GLib.get_user_runtime_dir()) / "swivel.pid"
 HID_UUID = "00001124-0000-1000-8000-00805f9b34fb"
 DEFAULTS = {"yaw_max": 35.0, "pitch_max": 20.0, "deadzone": 0.5, "curve": 1.0,
             "anti_deadzone": 0.2, "smooth": 0.35, "invert_yaw": False,
-            "invert_pitch": False, "pad": "xbox", "tracker": "", "drift": 0.5}
+            "invert_pitch": False, "pad": "xbox", "tracker": "", "drift": 0.5,
+            "yaw_axis": None, "pitch_axis": None}
 HISTORY_SECONDS = 10.0
 # Headsets send ~25 reports/s. If they go quiet this long, restart the tracker (it
 # re-enables the sensor). Restarts talk to the headset over Bluetooth, so keep them
@@ -163,6 +164,55 @@ def find_tracker(configured):
     return None
 
 
+# ---- orientation math ------------------------------------------------------------
+def q_from_euler(yaw, pitch, roll):
+    """sony-tracker's ZYX euler (degrees) back to a quaternion (w, x, y, z)."""
+    cy, sy = math.cos(math.radians(yaw) / 2), math.sin(math.radians(yaw) / 2)
+    cp, sp = math.cos(math.radians(pitch) / 2), math.sin(math.radians(pitch) / 2)
+    cr, sr = math.cos(math.radians(roll) / 2), math.sin(math.radians(roll) / 2)
+    return (cr * cp * cy + sr * sp * sy, sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy, cr * cp * sy - sr * sp * cy)
+
+
+def q_mul(a, b):
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return (aw * bw - ax * bx - ay * by - az * bz, aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx, aw * bz + ax * by - ay * bx + az * bw)
+
+
+def q_conj(q):
+    return (q[0], -q[1], -q[2], -q[3])
+
+
+def q_axis_angle(axis, deg):
+    h = math.radians(deg) / 2
+    return (math.cos(h), axis[0] * math.sin(h), axis[1] * math.sin(h), axis[2] * math.sin(h))
+
+
+def q_rotvec(q):
+    """Rotation vector in degrees (axis * angle)."""
+    w, x, y, z = q if q[0] >= 0 else (-q[0], -q[1], -q[2], -q[3])
+    n = math.sqrt(x * x + y * y + z * z)
+    if n < 1e-9:
+        return (0.0, 0.0, 0.0)
+    ang = math.degrees(2 * math.atan2(n, w))
+    return (x / n * ang, y / n * ang, z / n * ang)
+
+
+def v_norm(v):
+    n = math.sqrt(sum(c * c for c in v)) or 1.0
+    return tuple(c / n for c in v)
+
+
+def v_dot(a, b):
+    return sum(x * y for x, y in zip(a, b))
+
+
+def v_cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
 # ---- tracking engine --------------------------------------------------------------
 class Engine:
     def __init__(self, cfg):
@@ -182,6 +232,10 @@ class Engine:
         self.fail_streak = 0
         self.reanchor = False
         self.prev_pkt = None  # (time, yaw) for head speed
+        self.qc = (1.0, 0.0, 0.0, 0.0)  # center orientation
+        self.qr = (1.0, 0.0, 0.0, 0.0)  # current orientation relative to center
+        self.calib_sink = None  # list collecting relative rotations during calibration
+        self.calibrating = False
 
     def shape(self, deg, max_deg):
         dz = self.cfg["deadzone"]
@@ -192,8 +246,31 @@ class Engine:
         ad = self.cfg["anti_deadzone"]  # jump past the game's own stick deadzone
         return math.copysign(ad + (1 - ad) * x, deg)
 
+    def axes(self):
+        """(yaw axis, pitch axis) in the tracker's frame: calibrated, or its defaults."""
+        y = self.cfg.get("yaw_axis") or (0.0, 0.0, 1.0)
+        p = self.cfg.get("pitch_axis") or (0.0, 1.0, 0.0)
+        return tuple(y), tuple(p)
+
+    def decompose(self, r):
+        """Split a rotation vector into (yaw, pitch, roll) along the head axes.
+
+        Solves r = yaw*Y + pitch*P + roll*R jointly, so axes measured during
+        calibration don't have to be exactly perpendicular.
+        """
+        ya, pa = self.axes()
+        ra = v_norm(v_cross(pa, ya))
+        m = (ya, pa, ra)  # columns
+        det = v_dot(ya, v_cross(pa, ra))
+        if abs(det) < 1e-6:
+            return v_dot(r, ya), v_dot(r, pa), v_dot(r, ra)
+        # Cramer's rule
+        return (v_dot(r, v_cross(m[1], m[2])) / det,
+                v_dot(ya, v_cross(r, m[2])) / det,
+                v_dot(ya, v_cross(pa, r)) / det)
+
     def _correct_drift(self, now):
-        strength = self.cfg.get("drift", 0.5)
+        strength = 0 if self.calibrating else self.cfg.get("drift", 0.5)
         prev, self.prev_pkt = self.prev_pkt, (now, self.yaw)
         if strength <= 0 or prev is None:
             return
@@ -205,7 +282,7 @@ class Engine:
             # time constant: 8 s at strength 0.5, 4 s at 1.0
             k = min(1.0, dt * strength / 4.0)
             shift = self.yaw * k
-            self.center = (self.center[0] + shift, self.center[1], self.center[2])
+            self.qc = q_mul(self.qc, q_axis_angle(self.axes()[0], shift))
             self.yaw -= shift
 
     def start(self):
@@ -304,17 +381,20 @@ class Engine:
                 now = time.monotonic()
                 if data and len(data) >= 48:
                     _, _, _, yaw, pitch, roll = struct.unpack("<6d", data[:48])
+                    q = q_from_euler(yaw, pitch, roll)
                     if self.want_recenter:
-                        self.center = (yaw, pitch, roll)
+                        self.qc = q
                         self.want_recenter = False
                         self.reanchor = False
                     elif self.reanchor:
-                        self.center = (yaw - self.yaw, pitch - self.pitch, roll - self.roll)
+                        # new tracker, new zero: keep the last relative orientation
+                        self.qc = q_mul(q, q_conj(self.qr))
                         self.reanchor = False
-                    self.yaw = (yaw - self.center[0] + 180) % 360 - 180
+                    self.qr = q_mul(q_conj(self.qc), q)
+                    if self.calib_sink is not None:
+                        self.calib_sink.append(self.qr)
+                    self.yaw, self.pitch, self.roll = self.decompose(q_rotvec(self.qr))
                     self._correct_drift(now)
-                    self.pitch = pitch - self.center[1]
-                    self.roll = (roll - self.center[2] + 180) % 360 - 180
                     tx = self.shape(self.yaw, c["yaw_max"]) * (-1 if c["invert_yaw"] else 1)
                     ty = self.shape(self.pitch, c["pitch_max"]) * (-1 if c["invert_pitch"] else 1)
                     mag = math.hypot(tx, ty)
@@ -490,10 +570,18 @@ class Window(Adw.ApplicationWindow):
         recenter = Gtk.Button(label="Recenter", css_classes=["pill", "suggested-action"],
                               halign=Gtk.Align.CENTER)
         recenter.connect("clicked", lambda *_: setattr(self.engine, "want_recenter", True))
+        calibrate = Gtk.Button(label="Calibrate", css_classes=["pill"],
+                               tooltip_text="Teach Swivel which way is up and right for how you wear the headset")
+        calibrate.connect("clicked", lambda *_: self.start_calibration())
+        buttons = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER)
+        buttons.append(recenter)
+        buttons.append(calibrate)
+        self.calib_steps = None
+        self.calib_msg = None
 
         live = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=12, margin_bottom=6)
         for w in (self.status, row, self._titled(f"Last {HISTORY_SECONDS:.0f} seconds", self.graph),
-                  self.readout, recenter):
+                  self.readout, buttons):
             live.append(w)
 
         tune = Adw.PreferencesGroup(title="Tuning", description="Head angle for full stick, and feel")
@@ -517,8 +605,14 @@ class Window(Adw.ApplicationWindow):
         pad_row.set_selected(kinds.index(self.cfg.get("pad", "xbox")))
         pad_row.connect("notify::selected", lambda r, _p: self.set_cfg("pad", kinds[r.get_selected()]))
         ctl.add(pad_row)
-        self._switch(ctl, "Invert yaw", "invert_yaw")
-        self._switch(ctl, "Invert pitch", "invert_pitch")
+        self.inv_rows = {k: self._switch(ctl, t, k) for t, k in
+                         (("Invert yaw", "invert_yaw"), ("Invert pitch", "invert_pitch"))}
+        self.axes_row = Adw.ActionRow(title="Head axes")
+        reset_axes = Gtk.Button(label="Reset", valign=Gtk.Align.CENTER)
+        reset_axes.connect("clicked", lambda *_: self.reset_axes())
+        self.axes_row.add_suffix(reset_axes)
+        ctl.add(self.axes_row)
+        self._update_axes_row()
         hint = Adw.PreferencesGroup(
             description="Start this before the game. Recenter from a keyboard shortcut "
                         "bound to: swivel --recenter")
@@ -555,6 +649,116 @@ class Window(Adw.ApplicationWindow):
         row = Adw.SwitchRow(title=title, active=self.cfg[key])
         row.connect("notify::active", lambda r, _p: self.set_cfg(key, r.get_active()))
         group.add(row)
+        return row
+
+    # ---- calibration ----
+    def _update_axes_row(self):
+        done = bool(self.cfg.get("yaw_axis"))
+        self.axes_row.set_subtitle("Calibrated for how you wear the headset" if done
+                                   else "Default. Press Calibrate if up/down or left/right look mixed up")
+
+    def reset_axes(self):
+        self.set_cfg("yaw_axis", None)
+        self.set_cfg("pitch_axis", None)
+        self.engine.want_recenter = True
+        self._update_axes_row()
+
+    def start_calibration(self):
+        e = self.engine
+        if not e.running or e.status != "Tracking":
+            self._flash("Start tracking first, then press Calibrate")
+            return
+        if self.calib_steps:
+            return
+        self.results = {}
+        # (seconds, message, action at start, action at end)
+        self.calib_steps = [
+            (3.0, "Look straight at the screen and keep still", None, self._calib_center),
+            (1.5, "Now look UP and hold", None, self._calib_collect),
+            (1.5, "Keep holding UP", None, lambda: self._calib_take("up")),
+            (1.5, "Now look RIGHT and hold", None, self._calib_collect),
+            (1.5, "Keep holding RIGHT", None, lambda: self._calib_take("right")),
+            (2.0, "Look straight at the screen again", None, self._calib_finish),
+        ]
+        e.calibrating = True
+        self._calib_next()
+
+    def _calib_center(self):
+        self.engine.want_recenter = True
+
+    def _calib_collect(self):
+        self.engine.calib_sink = []
+
+    def _calib_take(self, name):
+        self.results[name] = self.engine.calib_sink or []
+        self.engine.calib_sink = None
+
+    def _calib_next(self):
+        if not self.calib_steps:
+            return False
+        secs, msg, _start, end = self.calib_steps[0]
+        t0 = time.monotonic()
+
+        def step():
+            left = secs - (time.monotonic() - t0)
+            if left > 0 and self.engine.running:
+                self.calib_msg = f"{msg}  ({math.ceil(left)})"
+                return True
+            if not self.engine.running:
+                self._calib_abort("Calibration stopped: tracking is off")
+                return False
+            if end:
+                end()
+            if self.calib_steps:
+                self.calib_steps.pop(0)
+                self._calib_next()
+            return False
+
+        GLib.timeout_add(100, step)
+        return False
+
+    def _calib_abort(self, msg):
+        self.calib_steps = None
+        self.engine.calib_sink = None
+        self.engine.calibrating = False
+        self._flash(msg)
+
+    def _calib_finish(self):
+        self.calib_steps = None
+        self.engine.calibrating = False
+
+        def mean_rotvec(samples):
+            vs = [q_rotvec(q) for q in samples]
+            return tuple(sum(v[i] for v in vs) / len(vs) for i in range(3)) if vs else (0.0, 0.0, 0.0)
+
+        up, right = mean_rotvec(self.results.get("up", [])), mean_rotvec(self.results.get("right", []))
+        mu, mr = math.sqrt(v_dot(up, up)), math.sqrt(v_dot(right, right))
+        if mu < 8 or mr < 8:
+            self._flash("Calibration failed: turn your head further (at least ~15°) and hold it")
+            return
+        pa, ya = v_norm(up), v_norm(right)
+        if abs(v_dot(pa, ya)) > 0.9:
+            self._flash("Calibration failed: up and right looked the same, try again")
+            return
+        self.set_cfg("pitch_axis", list(pa))
+        self.set_cfg("yaw_axis", list(ya))
+        for row in self.inv_rows.values():
+            row.set_active(False)  # calibration already defines up = up, right = right
+        self.engine.want_recenter = True
+        self._update_axes_row()
+        self._flash("Calibrated. Up/down and left/right now follow your head")
+
+    def _flash(self, msg, secs=4.0):
+        self.calib_msg = msg
+        until = time.monotonic() + secs
+
+        def clear():
+            if time.monotonic() >= until and not self.calib_steps:
+                self.calib_msg = None
+                return False
+            return True
+
+        GLib.timeout_add(200, clear)
 
     def set_cfg(self, key, val):
         self.cfg[key] = val
@@ -579,7 +783,7 @@ class Window(Adw.ApplicationWindow):
         if not e.running and e.pad is not None:  # tracker died: clean up, keep its message
             e.stop(keep_status=True)
             self.toggle.set_active(False)
-        self.status.set_label(e.status)
+        self.status.set_label(self.calib_msg or e.status)
         self.readout.set_label(f"yaw {e.yaw:+6.1f}°    pitch {e.pitch:+6.1f}°    roll {e.roll:+6.1f}°")
         for w in (self.stick, self.model, self.graph):
             w.queue_draw()
