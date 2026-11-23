@@ -44,7 +44,7 @@ HID_UUID = "00001124-0000-1000-8000-00805f9b34fb"
 DEFAULTS = {"yaw_max": 35.0, "pitch_max": 20.0, "deadzone": 0.5, "curve": 1.0,
             "anti_deadzone": 0.2, "smooth": 0.35, "invert_yaw": False,
             "invert_pitch": False, "pad": "playstation", "tracker": "", "drift": 0.5,
-            "yaw_axis": None, "pitch_axis": None}
+            "yaw_axis": None, "pitch_axis": None, "bias": None}
 HISTORY_SECONDS = 10.0
 # Headsets send ~25 reports/s. If they go quiet this long, restart the tracker (it
 # re-enables the sensor). Restarts talk to the headset over Bluetooth, so keep them
@@ -213,6 +213,33 @@ def v_cross(a, b):
     return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
 
 
+class OneEuro:
+    """One Euro filter: strong smoothing when moving slowly, little lag when moving fast."""
+
+    def __init__(self, min_cutoff=1.0, beta=1.0, d_cutoff=1.0):
+        self.min_cutoff, self.beta, self.d_cutoff = min_cutoff, beta, d_cutoff
+        self.x = self.dx = None
+
+    @staticmethod
+    def _alpha(cutoff, dt):
+        tau = 1.0 / (2 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+    def __call__(self, x, dt):
+        if self.x is None or dt <= 0:
+            self.x, self.dx = x, 0.0
+            return x
+        dx = (x - self.x) / dt
+        self.dx += self._alpha(self.d_cutoff, dt) * (dx - self.dx)
+        cutoff = self.min_cutoff + self.beta * abs(self.dx)
+        self.x += self._alpha(cutoff, dt) * (x - self.x)
+        return self.x
+
+
+OUTPUT_HZ = 120  # stick updates per second (the headset only reports ~25/s)
+GLIDE_SECONDS = 0.03  # how fast the stick glides to each new filtered target
+
+
 # ---- tracking engine --------------------------------------------------------------
 class Engine:
     def __init__(self, cfg):
@@ -236,6 +263,9 @@ class Engine:
         self.qr = (1.0, 0.0, 0.0, 0.0)  # current orientation relative to center
         self.calib_sink = None  # list collecting relative rotations during calibration
         self.calibrating = False
+        self.target = (0.0, 0.0)
+        self.filters = (OneEuro(), OneEuro())
+        self.out_thread = None
 
     def shape(self, deg, max_deg):
         dz = self.cfg["deadzone"]
@@ -298,8 +328,12 @@ class Engine:
         self.restarts = 0
         self.last_packet = self.spawned = time.monotonic()
         self.status = "Connecting to headphones…"
+        self.target = (0.0, 0.0)
+        self.filters = (OneEuro(), OneEuro())
         self.thread = threading.Thread(target=self._loop, args=(tracker,), daemon=True)
         self.thread.start()
+        self.out_thread = threading.Thread(target=self._output_loop, daemon=True)
+        self.out_thread.start()
 
     def _spawn(self, tracker):
         # stderr goes to a file: a pipe nobody reads fills up and blocks the tracker
@@ -328,8 +362,9 @@ class Engine:
 
     def stop(self, keep_status=False):
         self.running = False
-        if self.thread and self.thread is not threading.current_thread():
-            self.thread.join(2)
+        for t in (self.thread, self.out_thread):
+            if t and t is not threading.current_thread():
+                t.join(2)
         self._kill_proc()
         if self.errlog:
             self.errlog.close()
@@ -344,6 +379,30 @@ class Engine:
         self.sx = self.sy = 0.0
         if not keep_status:
             self.status = "Stopped"
+
+    def _output_loop(self):
+        """Glide the stick toward the filtered target at OUTPUT_HZ for smooth camera motion."""
+        period = 1.0 / OUTPUT_HZ
+        a = 1 - math.exp(-period / GLIDE_SECONDS)
+        nxt = time.monotonic()
+        while self.running:
+            with self.lock:
+                tx, ty = self.target
+                self.sx += (tx - self.sx) * a
+                self.sy += (ty - self.sy) * a
+                if self.pad:
+                    self.pad.right_stick(self.sx, self.sy)
+            nxt += period
+            time.sleep(max(0.0, nxt - time.monotonic()))
+
+    def _apply_bias(self, dt):
+        """Cancel the gyro's constant creep measured during calibration."""
+        b = self.cfg.get("bias")
+        if not b or self.calibrating or not 0 < dt < 0.5:
+            return
+        rate = math.sqrt(v_dot(b, b))
+        if rate > 1e-6:
+            self.qc = q_mul(self.qc, q_axis_angle(v_norm(b), rate * dt))
 
     def _loop(self, tracker):
         if not sony_hidraw_present():
@@ -382,6 +441,8 @@ class Engine:
                 if data and len(data) >= 48:
                     _, _, _, yaw, pitch, roll = struct.unpack("<6d", data[:48])
                     q = q_from_euler(yaw, pitch, roll)
+                    pkt_dt = now - self.last_packet
+                    self._apply_bias(pkt_dt)
                     if self.want_recenter:
                         self.qc = q
                         self.want_recenter = False
@@ -392,7 +453,7 @@ class Engine:
                         self.reanchor = False
                     self.qr = q_mul(q_conj(self.qc), q)
                     if self.calib_sink is not None:
-                        self.calib_sink.append(self.qr)
+                        self.calib_sink.append((now, self.qr))
                     self.yaw, self.pitch, self.roll = self.decompose(q_rotvec(self.qr))
                     self._correct_drift(now)
                     tx = self.shape(self.yaw, c["yaw_max"]) * (-1 if c["invert_yaw"] else 1)
@@ -400,9 +461,12 @@ class Engine:
                     mag = math.hypot(tx, ty)
                     if mag > 1:  # round gate, like a real stick
                         tx, ty = tx / mag, ty / mag
-                    k = c["smooth"]
-                    self.sx = k * self.sx + (1 - k) * tx
-                    self.sy = k * self.sy + (1 - k) * ty
+                    # Smoothing slider -> One Euro minimum cutoff (0 = snappy, 0.9 = very smooth)
+                    mc = 0.4 + 4.0 * (1 - c["smooth"])
+                    fx, fy = self.filters
+                    fx.min_cutoff = fy.min_cutoff = mc
+                    dt = pkt_dt if 0 < pkt_dt < 0.5 else 0.04
+                    self.target = (fx(tx, dt), fy(ty, dt))
                     self.last_packet = now
                     self.fail_streak = 0
                     self.status = "Tracking"
@@ -410,11 +474,9 @@ class Engine:
                         self.history.append((now, self.yaw, self.pitch, self.roll))
                 elif now - self.last_packet > 1.0:
                     # hold the camera through short dropouts, recenter on long ones
-                    self.sx *= 0.5
-                    self.sy *= 0.5
+                    self.target = (self.target[0] * 0.5, self.target[1] * 0.5)
                     if self.status == "Tracking":
                         self.status = "No data from headphones"
-                self.pad.right_stick(self.sx, self.sy)
 
 
 # ---- drawing --------------------------------------------------------------------------
@@ -663,12 +725,15 @@ class Window(Adw.ApplicationWindow):
     # ---- calibration ----
     def _update_axes_row(self):
         done = bool(self.cfg.get("yaw_axis"))
-        self.axes_row.set_subtitle("Calibrated for how you wear the headset" if done
-                                   else "Default. Press Calibrate if up/down or left/right look mixed up")
+        b = self.cfg.get("bias")
+        creep = f", gyro creep {math.sqrt(v_dot(b, b)):.2f}°/s cancelled" if b else ""
+        self.axes_row.set_subtitle(f"Calibrated for how you wear the headset{creep}" if done
+                                   else "Default. Press Calibrate for accurate axes and less drift")
 
     def reset_axes(self):
         self.set_cfg("yaw_axis", None)
         self.set_cfg("pitch_axis", None)
+        self.set_cfg("bias", None)
         self.engine.want_recenter = True
         self._update_axes_row()
 
@@ -682,7 +747,8 @@ class Window(Adw.ApplicationWindow):
         self.results = {}
         # (seconds, message, action at start, action at end)
         self.calib_steps = [
-            (3.0, "Look straight at the screen and keep still", None, self._calib_center),
+            (5.0, "Look straight at the screen and keep very still", self._calib_center_collect,
+             lambda: self._calib_take("still")),
             (1.5, "Now look UP and hold", None, self._calib_collect),
             (1.5, "Keep holding UP", None, lambda: self._calib_take("up")),
             (1.5, "Now look RIGHT and hold", None, self._calib_collect),
@@ -692,8 +758,9 @@ class Window(Adw.ApplicationWindow):
         e.calibrating = True
         self._calib_next()
 
-    def _calib_center(self):
+    def _calib_center_collect(self):
         self.engine.want_recenter = True
+        self.engine.calib_sink = []
 
     def _calib_collect(self):
         self.engine.calib_sink = []
@@ -705,7 +772,9 @@ class Window(Adw.ApplicationWindow):
     def _calib_next(self):
         if not self.calib_steps:
             return False
-        secs, msg, _start, end = self.calib_steps[0]
+        secs, msg, start, end = self.calib_steps[0]
+        if start:
+            start()
         t0 = time.monotonic()
 
         def step():
@@ -737,7 +806,7 @@ class Window(Adw.ApplicationWindow):
         self.engine.calibrating = False
 
         def mean_rotvec(samples):
-            vs = [q_rotvec(q) for q in samples]
+            vs = [q_rotvec(q) for _t, q in samples]
             return tuple(sum(v[i] for v in vs) / len(vs) for i in range(3)) if vs else (0.0, 0.0, 0.0)
 
         up, right = mean_rotvec(self.results.get("up", [])), mean_rotvec(self.results.get("right", []))
@@ -751,11 +820,34 @@ class Window(Adw.ApplicationWindow):
             return
         self.set_cfg("pitch_axis", list(pa))
         self.set_cfg("yaw_axis", list(ya))
+        bias = self._measure_bias(self.results.get("still", []))
+        self.set_cfg("bias", list(bias) if bias else None)
         for row in self.inv_rows.values():
             row.set_active(False)  # calibration already defines up = up, right = right
         self.engine.want_recenter = True
         self._update_axes_row()
         self._flash("Calibrated. Up/down and left/right now follow your head")
+
+    @staticmethod
+    def _measure_bias(samples):
+        """Slope of the rotation vector while holding still = the gyro's constant creep (deg/s)."""
+        samples = samples[len(samples) // 5:]  # skip the first second (recenter settling)
+        if len(samples) < 40:
+            return None
+        ts = [t for t, _q in samples]
+        vs = [q_rotvec(q) for _t, q in samples]
+        tm = sum(ts) / len(ts)
+        den = sum((t - tm) ** 2 for t in ts)
+        if den <= 0:
+            return None
+        slope = []
+        for i in range(3):
+            vm = sum(v[i] for v in vs) / len(vs)
+            slope.append(sum((t - tm) * (v[i] - vm) for t, v in zip(ts, vs)) / den)
+        rate = math.sqrt(sum(x * x for x in slope))
+        spread = max(max(v[i] for v in vs) - min(v[i] for v in vs) for i in range(3))
+        # only trust it if the head really was still and the creep is plausible
+        return tuple(slope) if 0.005 < rate < 2.0 and spread < 6.0 else None
 
     def _flash(self, msg, secs=4.0):
         self.calib_msg = msg

@@ -23,7 +23,11 @@ both.
   so it doesn't keep stealing the "active controller" from your real pad
 - **Calibrate** button: look straight, up, then right when prompted, and Swivel learns
   how the headset's sensor sits on your head. Fixes nodding showing up as turning
-  (or roll), which happens because the sensor in the ear cup is tilted
+  (or roll), which happens because the sensor in the ear cup is tilted. It also
+  measures the gyro's constant creep while you hold still and cancels it
+- Smooth camera: the headset reports ~25 times a second; Swivel filters with a One
+  Euro filter (steady when you're still, quick when you turn) and glides the stick
+  at 120 Hz
 - Connects the headset's head-tracking channel automatically (most Sony headsets
   connect for audio only)
 - Recenter button and keyboard shortcut, plus automatic drift correction: the
