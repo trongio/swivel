@@ -285,7 +285,7 @@ class CamSource:
         self.sock = self.log = self.proc = None
         self.last = None
 TRACE_DT = float(os.environ.get("SWIVEL_TRACE_DT", "0.2"))  # seconds between trace rows
-CAM_STALE = 0.4  # seconds; older webcam poses are ignored
+CAM_STALE = 0.6  # seconds; older webcam poses are ignored
 CAM_DISAGREE = 12.0  # degrees; beyond this the cameras are not averaged
 CAM_TAU = 2.0  # seconds; how fast the cameras pull the headphone center back
 CAM_MAX_SPEED_DPS = 150.0  # skip corrections during very fast turns (motion blur)
