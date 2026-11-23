@@ -241,7 +241,7 @@ CAM_PORT = 4243
 CAM_STALE = 0.4  # seconds; older webcam poses are ignored
 CAM_TAU = 1.5  # seconds; how fast the webcam pulls the headphone center back
 CAM_MAX_SPEED_DPS = 40.0  # only correct while the head moves slower than this
-CAM_MAX_ANGLE = 35.0  # face tracking is unreliable beyond this
+CAM_MAX_ANGLE = 25.0  # only trust face tracking this close to center
 
 
 def find_uv():
@@ -963,8 +963,8 @@ class Window(Adw.ApplicationWindow):
     def _calib_finish(self):
         self.calib_steps = None
         self.engine.calibrating = False
-        cam_msg = self._calib_cam_signs()
         if self.engine.mode() == "control":
+            cam_msg = self._calib_cam_signs(None, None)
             self.engine.want_recenter = True
             self._flash(cam_msg or "Calibration failed: the webcam didn't see your face")
             return
@@ -986,14 +986,17 @@ class Window(Adw.ApplicationWindow):
         self.set_cfg("yaw_axis", list(ya))
         bias = self._measure_bias(self.results.get("still", []))
         self.set_cfg("bias", list(bias) if bias else None)
+        # head angles the headphones measured in the holds, with the new axes
+        hp = [self.engine.decompose(v) for v in (mean_rotvec(self.results["right"]), mean_rotvec(self.results["up"]))]
+        cam_msg = self._calib_cam_signs(hp[0][0], hp[1][1])
         for row in self.inv_rows.values():
             row.set_active(False)  # calibration already defines up = up, right = right
         self.engine.want_recenter = True
         self._update_axes_row()
         self._flash("Calibrated. Up/down and left/right now follow your head" + (f". {cam_msg}" if cam_msg else ""))
 
-    def _calib_cam_signs(self):
-        """Learn which way the webcam's yaw/pitch grow when you look right/up."""
+    def _calib_cam_signs(self, hp_yaw, hp_pitch):
+        """Learn the webcam's direction and scale: webcam degrees -> headphone degrees."""
         still, up, right = (self.results.get(k) for k in ("cam_still", "cam_up", "cam_right"))
         if not still or not up or not right:
             return ""
@@ -1002,7 +1005,12 @@ class Window(Adw.ApplicationWindow):
         dp = sum(v[1] for v in up) / len(up) - base[1]
         if abs(dy) < 5 or abs(dp) < 5:
             return "Webcam not calibrated: turn further"
-        self.set_cfg("cam_sign", [1 if dy > 0 else -1, 1 if dp > 0 else -1])
+
+        def gain(hp, cam):
+            g = (hp / cam) if hp else (1.0 if cam > 0 else -1.0)
+            return g if 0.4 <= abs(g) <= 2.5 else (1.0 if g > 0 else -1.0)
+
+        self.set_cfg("cam_sign", [gain(hp_yaw, dy), gain(hp_pitch, dp)])
         self.engine.cam_want_recenter = True
         return "Webcam calibrated"
 
@@ -1063,7 +1071,11 @@ class Window(Adw.ApplicationWindow):
             e.stop(keep_status=True)
             self.toggle.set_active(False)
         self.status.set_label(self.calib_msg or e.status)
-        cam = f"    ·    {e.cam_status}" if e.running and e.mode() != "off" and e.cam_status else ""
+        cam = ""
+        if e.running and e.mode() != "off":
+            cam = f"    ·    {e.cam_status}"
+            if e.cam and e.mode() == "assist":
+                cam += f" (yaw {e.cam[1]:+.0f}°, pitch {e.cam[2]:+.0f}°)"
         self.readout.set_label(f"yaw {e.yaw:+6.1f}°    pitch {e.pitch:+6.1f}°    roll {e.roll:+6.1f}°{cam}")
         for w in (self.stick, self.model, self.graph):
             w.queue_draw()
