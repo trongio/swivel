@@ -94,14 +94,27 @@ class OpenTrackNN:
         cy = min(max(by + 0.5 * bh, 0.0), gray.shape[0])
         patch = cv2.getRectSubPix(gray, (size, size), (cx, cy))
         x = self.normalize_brightness(cv2.resize(patch, (129, 129), interpolation=cv2.INTER_AREA))
-        out = dict(zip(self.out_names, self.pose.run(self.out_names, {"x": x[None, None]})))
+        # run the original and the mirrored crop in one batch, average the two estimates
+        batch = np.stack([x, x[:, ::-1]])[:, None].copy()
+        try:
+            res = self.pose.run(self.out_names, {"x": batch})
+            outs = [dict(zip(self.out_names, [r[i:i + 1] for r in res])) for i in (0, 1)]
+        except Exception:  # model without a dynamic batch axis: run twice
+            outs = [dict(zip(self.out_names, self.pose.run(self.out_names, {"x": v[None, None].copy()})))
+                    for v in (x, x[:, ::-1])]
+        out = outs[0]
         q = out["quat"][0]  # x, y, z, w
         ob = out["box"][0]
         half = 0.5 * size
         nb = (cx + half * ob[0], cy + half * ob[1], half * (ob[2] - ob[0]), half * (ob[3] - ob[1]))
         # rotation uncertainty: large -> lost the head, relocalize next frame
         unc = float(np.abs(out["rotaxis_scales_tril"][0]).max()) if "rotaxis_scales_tril" in out else 0.0
-        self.box = nb if nb[2] > 10 and nb[3] > 10 and unc < 0.5 else None
+        if nb[2] > 10 and nb[3] > 10 and unc < 0.5:
+            # smooth the crop box: a box that jumps a few pixels per frame shows up as pose jitter
+            k = 0.35
+            self.box = tuple(o + k * (n - o) for o, n in zip(self.box, nb)) if self.box else nb
+        else:
+            self.box = None
         w_, x_, y_, z_ = float(q[3]), float(q[0]), float(q[1]), float(q[2])
         if w_ < 0:
             w_, x_, y_, z_ = -w_, -x_, -y_, -z_
@@ -110,7 +123,21 @@ class OpenTrackNN:
             return 0.0, 0.0, 0.0
         ang = math.degrees(2 * math.atan2(n, w_))
         rx, ry, rz = x_ / n * ang, y_ / n * ang, z_ / n * ang
+        mx, my, mz = self.rotvec(outs[1]["quat"][0])
+        # mirroring negates rotation about the vertical (y) and viewing (z) axes
+        rx, ry, rz = (rx + mx) / 2, (ry - my) / 2, (rz - mz) / 2
         return ry, rx, rz  # yaw about the vertical image axis, pitch about horizontal
+
+    @staticmethod
+    def rotvec(q):
+        w_, x_, y_, z_ = float(q[3]), float(q[0]), float(q[1]), float(q[2])
+        if w_ < 0:
+            w_, x_, y_, z_ = -w_, -x_, -y_, -z_
+        n = math.sqrt(x_ * x_ + y_ * y_ + z_ * z_)
+        if n < 1e-9:
+            return 0.0, 0.0, 0.0
+        ang = math.degrees(2 * math.atan2(n, w_))
+        return x_ / n * ang, y_ / n * ang, z_ / n * ang
 
 
 class OneEuro:
