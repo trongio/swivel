@@ -18,9 +18,10 @@ both.
 - Tuning that applies instantly: range, deadzone, response curve, smoothing, and
   **game deadzone compensation** (skips the game's own dead stick zone so small
   head turns register instead of feeling sticky)
-- PlayStation or Xbox virtual controller. PlayStation is the default, so games show
-  PS button prompts. Swivel only sends input when your head moves, so it doesn't
-  keep stealing the "active controller" from your real pad
+- Xbox (default) or PlayStation virtual controller. Keep Xbox when you play with a
+  real DualSense: under Proton a fake PlayStation pad can confuse a game's native
+  DualSense support and scramble the buttons. Swivel only sends input when your head
+  moves, so it doesn't keep stealing the "active controller" from your real pad
 - Connects the headset's head-tracking channel automatically (most Sony headsets
   connect for audio only)
 - Recenter button, plus a signal for a keyboard shortcut

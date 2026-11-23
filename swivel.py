@@ -43,7 +43,7 @@ PIDFILE = Path(GLib.get_user_runtime_dir()) / "swivel.pid"
 HID_UUID = "00001124-0000-1000-8000-00805f9b34fb"
 DEFAULTS = {"yaw_max": 35.0, "pitch_max": 20.0, "deadzone": 0.5, "curve": 1.0,
             "anti_deadzone": 0.2, "smooth": 0.35, "invert_yaw": False,
-            "invert_pitch": False, "pad": "playstation", "tracker": ""}
+            "invert_pitch": False, "pad": "xbox", "tracker": ""}
 HISTORY_SECONDS = 10.0
 # Headsets send ~25 reports/s (gaps <= ~65 ms). If they go quiet for this long, restart
 # the tracker (it re-enables the sensor and streams again ~175 ms later). Backs off when
@@ -191,7 +191,7 @@ class Engine:
         tracker = find_tracker(self.cfg.get("tracker"))
         if not tracker:
             raise FileNotFoundError("sony-tracker not found (install it or set its path)")
-        self.pad = VirtualPad(self.cfg.get("pad", "playstation"))
+        self.pad = VirtualPad(self.cfg.get("pad", "xbox"))
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("127.0.0.1", PORT))
         self.sock.settimeout(0.05)
@@ -487,11 +487,11 @@ class Window(Adw.ApplicationWindow):
         self._spin(tune, "Smoothing", "Higher is smoother but adds lag", "smooth", 0, 0.9, 0.05, 2)
 
         ctl = Adw.PreferencesGroup(title="Controller")
-        kinds = list(PADS)
+        kinds = ["playstation", "xbox"]
         pad_row = Adw.ComboRow(title="Controller type",
-                               subtitle="PlayStation shows PS button prompts. Applies on next start",
+                               subtitle="Keep Xbox if you use a real DualSense in the game. Applies on next start",
                                model=Gtk.StringList.new(["PlayStation", "Xbox"]))
-        pad_row.set_selected(kinds.index(self.cfg.get("pad", "playstation")))
+        pad_row.set_selected(kinds.index(self.cfg.get("pad", "xbox")))
         pad_row.connect("notify::selected", lambda r, _p: self.set_cfg("pad", kinds[r.get_selected()]))
         ctl.add(pad_row)
         self._switch(ctl, "Invert yaw", "invert_yaw")
