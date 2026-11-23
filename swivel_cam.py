@@ -62,6 +62,8 @@ class OpenTrackNN:
                                          opts, providers=prov)
         self.out_names = [o.name for o in self.pose.get_outputs()]
         self.box = None
+        self.fov = 95.0  # diagonal field of view at zoom 1 (Anker PowerConf C200 widest)
+        self.zoom = 1.0
 
     def localize(self, gray):
         h, w = gray.shape
@@ -127,7 +129,29 @@ class OpenTrackNN:
         mx, my, mz = self.rotvec(outs[1]["quat"][0])
         # mirroring negates rotation about the vertical (y) and viewing (z) axes
         rx, ry, rz = (rx + mx) / 2, (ry - my) / 2, (rz - mz) / 2
+        rx, ry, rz = self.line_of_sight(rx, ry, rz, cx, cy, gray.shape[1], gray.shape[0])
         return ry, rx, rz  # yaw about the vertical image axis, pitch about horizontal
+
+    def line_of_sight(self, rx, ry, rz, x, y, w, h):
+        """The net reads the head's rotation relative to the line from the camera to the head,
+        so leaning or sliding sideways looks like turning. Rotate by that line's angle off the
+        camera axis (as OpenTrack does) so only real head turns remain."""
+        a = w / h
+        t = math.tan(math.radians(self.fov) / 2) / self.zoom
+        tw, th = t / math.sqrt(1 + 1 / (a * a)), t / math.sqrt(1 + a * a)
+        ray = ((x / w * 2 - 1) * tw, (y / h * 2 - 1) * th, 1.0)
+        ax, ay = -ray[1], ray[0]  # (0, 0, 1) x ray
+        s_ = math.hypot(ax, ay)
+        ang = math.atan2(s_, 1.0)
+        qc = (math.cos(ang / 2), *(v / s_ * math.sin(ang / 2) if s_ > 1e-9 else 0.0 for v in (ax, ay, 0.0)))
+        n = math.sqrt(rx * rx + ry * ry + rz * rz)
+        th_ = math.radians(n)
+        qm = (math.cos(th_ / 2), *((v / n * math.sin(th_ / 2)) if n > 1e-9 else 0.0 for v in (rx, ry, rz)))
+        w1, x1, y1, z1 = qc
+        w2, x2, y2, z2 = qm
+        q = (w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2, w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+             w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2, w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2)
+        return self.rotvec((q[1], q[2], q[3], q[0]))
 
     @staticmethod
     def rotvec(q):
@@ -179,6 +203,7 @@ def main():
     ap.add_argument("--raw", action="store_true", help="disable smoothing")
     ap.add_argument("--backend", choices=["opentrack", "mediapipe"], default="opentrack")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--fov", type=float, default=95.0, help="diagonal field of view at zoom 1 (degrees)")
     ap.add_argument("--preview", type=int, default=0, help="send a JPEG preview to this local UDP port")
     a = ap.parse_args()
 
@@ -246,11 +271,17 @@ def run_opentrack(cap, a):
     filters = [OneEuro() for _ in range(3)]
     last_t = None
     prev_t = 0.0
+    nn.fov = a.fov
+    zoom_t = 0.0
     while True:
         ok, frame = cap.read()
         if not ok:
             time.sleep(0.05)
             continue
+        if time.monotonic() - zoom_t > 1.0:  # Swivel can change the zoom while we run
+            zoom_t = time.monotonic()
+            z = cap.get(cv2.CAP_PROP_ZOOM)
+            nn.zoom = z / 100 if z and z >= 100 else 1.0
         ang = nn(frame)
         if ang is not None:
             now = time.monotonic()

@@ -184,12 +184,45 @@ class NnTracker(context: Context, private val onPose: (Pose, Long) -> Unit) {
             val old = box
             if (old == null) nb else FloatArray(4) { old[it] + 0.35f * (nb[it] - old[it]) }
         } else null
-        val r = rotvec(a.quat)
-        if (m == null) return doubleArrayOf(r[1], r[0], r[2])
-        val rm = rotvec(m.quat)
-        // mirroring negates rotation about the vertical (y) and viewing (z) axes
-        val rx = (r[0] + rm[0]) / 2; val ry = (r[1] - rm[1]) / 2; val rz = (r[2] - rm[2]) / 2
-        return doubleArrayOf(ry, rx, rz)
+        var r = rotvec(a.quat)
+        if (m != null) {
+            val rm = rotvec(m.quat)
+            // mirroring negates rotation about the vertical (y) and viewing (z) axes
+            r = doubleArrayOf((r[0] + rm[0]) / 2, (r[1] - rm[1]) / 2, (r[2] - rm[2]) / 2)
+        }
+        r = lineOfSight(r, cx.toDouble(), cy.toDouble())
+        return doubleArrayOf(r[1], r[0], r[2])
+    }
+
+    /** Diagonal field of view of the front camera (Galaxy S22 Ultra: about 80 degrees). */
+    var fovDeg = 80.0
+
+    /**
+     * The net reads rotation relative to the line from the camera to the head, so moving the
+     * head sideways looks like turning. Rotate by that line's angle (as OpenTrack does).
+     */
+    private fun lineOfSight(r: DoubleArray, x: Double, y: Double): DoubleArray {
+        val a = fw.toDouble() / fh
+        val t = kotlin.math.tan(Math.toRadians(fovDeg) / 2)
+        val tw = t / sqrt(1 + 1 / (a * a)); val th = t / sqrt(1 + a * a)
+        val rx = (x / fw * 2 - 1) * tw; val ry = (y / fh * 2 - 1) * th
+        val ax = -ry; val ay = rx
+        val s = sqrt(ax * ax + ay * ay)
+        val half = atan2(s, 1.0) / 2
+        val qc = if (s > 1e-9) doubleArrayOf(kotlin.math.cos(half), ax / s * kotlin.math.sin(half), ay / s * kotlin.math.sin(half), 0.0)
+                 else doubleArrayOf(1.0, 0.0, 0.0, 0.0)
+        val n = sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2])
+        val hm = Math.toRadians(n) / 2
+        val qm = if (n > 1e-9) doubleArrayOf(kotlin.math.cos(hm), r[0] / n * kotlin.math.sin(hm), r[1] / n * kotlin.math.sin(hm), r[2] / n * kotlin.math.sin(hm))
+                 else doubleArrayOf(1.0, 0.0, 0.0, 0.0)
+        val (w1, x1, y1, z1) = qc
+        val (w2, x2, y2, z2) = qm
+        val q = floatArrayOf(
+            (w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2).toFloat(),
+            (w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2).toFloat(),
+            (w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2).toFloat(),
+            (w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2).toFloat())
+        return rotvec(q)
     }
 
     fun close() { loc.close(); pose.close() }
